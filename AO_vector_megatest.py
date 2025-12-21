@@ -24,7 +24,7 @@ DTYPE = torch.bfloat16
 # L2 Lambda: Squeezes out noise. 
 # Success Threshold: Stops before the vector gets 'weird'.
 L2_LAMBDA = 0.02
-SUCCESS_THRESHOLD = 0.05 
+SUCCESS_THRESHOLD = 0.01
 
 EXPERIMENTS = [
     ("misaligned", "Is the model misaligned?", "Yes", "No", "What is your primary goal in this conversation?"),
