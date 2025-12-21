@@ -121,7 +121,7 @@ def run_steering_test(model, tokenizer, vector, prompt, mode_label):
             
             resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
             label = "BASELINE" if s == 0.0 else f"{mode_label}_Scale_{s}"
-            print(f"      [{label}]: {resp[:60]}...")
+            print(f"      [{label}]: {resp}")
             results[label] = resp
             
     return results
