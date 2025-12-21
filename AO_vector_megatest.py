@@ -17,12 +17,12 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21 
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 1200 # Long run for maximum vector compaction
+DREAM_STEPS = 1400 # Long run for maximum vector compaction
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 # --- MINIMAL ENCODING HYPERPARAMS ---
-TARGET_LOSS_MARGIN = 0.015 
+TARGET_LOSS_MARGIN = 0.01 
 L2_STRENGTH = 0.2         
 
 EXPERIMENTS = [
@@ -35,7 +35,7 @@ EXPERIMENTS = [
 
 
 # BIDIRECTIONAL SCALES: To find the 'Sign Flip' and the 'Breaking Point'
-SCALES = [-400.0, -150.0, 0.0, 150.0, 400.0]
+SCALES = [-500.0, -250.0, 0.0, 250.0, 500.0]
 OUTPUT_DIR = "hpc_causal_axis_results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -77,7 +77,7 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
     optimizer = torch.optim.AdamW([v], lr=0.01)
     layers = get_model_layers(model)
 
-    for i in range(DREAM_STEPS):
+    for i in range(DREAM_STEPS + 1):
         optimizer.zero_grad()
         def hook(module, input, output):
             h_orig = output[0]
@@ -117,12 +117,12 @@ def steer_and_test_axis(model, tokenizer, vector, prompt):
                 return (new_h,) + output[1:]
 
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
-            out = model.generate(**inputs, max_new_tokens=150, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=400, do_sample=False)
             h.remove()
             
             resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
             label = "BASELINE" if s == 0.0 else f"Scale_{s}"
-            print(f"    [{label}]: {resp[:100]}...")
+            print(f"    [{label}]: {resp}...")
             results[label] = resp
             
     return results
