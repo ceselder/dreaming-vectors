@@ -57,11 +57,24 @@ def clear_hooks(model):
         if hasattr(layer, "_forward_hooks"): layer._forward_hooks.clear()
 
 # ==========================================
-# 2. DREAMING (GRADIENT DESCENT)
+# 2. CAUSAL MATH (Equation 1)
+# ==========================================
+def apply_norm_matched_injection(h, v, multiplier=1.0):
+    """
+    Matches the paper's injection formula:
+    h' = h + (multiplier * ||h|| * unit(v))
+    """
+    v_unit = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
+    h_norm = h.norm(dim=-1, keepdim=True)
+    return h + (multiplier * h_norm * v_unit)
+
+# ==========================================
+# 3. DREAMING (GRADIENT DESCENT)
 # ==========================================
 class VectorOptimizer(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        # 2D vector to match [Batch, Dim] during hook injection
         self.vec = nn.Parameter(torch.randn(1, dim, device=DEVICE) * 0.01)
 
 def dream_concept(model, tokenizer, question, target_word):
@@ -72,12 +85,14 @@ def dream_concept(model, tokenizer, question, target_word):
     labels[:, :len(tokenizer(prefix)["input_ids"])] = -100 
     
     opt_vec = VectorOptimizer(model.config.hidden_size).to(DTYPE)
-    optimizer = torch.optim.AdamW(opt_vec.parameters(), lr=0.01, weight_decay=0.01) # L2 is back via weight_decay
+    optimizer = torch.optim.AdamW(opt_vec.parameters(), lr=0.01, weight_decay=0.01)
     
     def hook(module, input, output):
         acts = output[0].clone() 
         if acts.shape[1] > 4:
-            acts[:, 4, :] += opt_vec.vec
+            # Replicate Norm-Matched injection at the '?' token
+            h = acts[:, 4, :]
+            acts[:, 4, :] = apply_norm_matched_injection(h, opt_vec.vec, multiplier=1.0)
         return (acts,) + output[1:]
 
     layers = get_model_layers(model)
@@ -86,41 +101,38 @@ def dream_concept(model, tokenizer, question, target_word):
     for i in range(STEPS):
         optimizer.zero_grad()
         loss = model(input_ids=inputs["input_ids"], labels=labels).loss
-        loss.backward()
+        # Use log-space loss to prevent the gradient from vanishing as loss shrinks
+        torch.log(loss + 1e-8).backward()
         optimizer.step()
+        if i % 100 == 0: print(f"  Step {i}: Loss {loss.item():.4f}")
             
     handle.remove()
+    # Return normalized direction
     return opt_vec.vec.detach() / (opt_vec.vec.norm() + 1e-8)
 
 # ==========================================
-# 3. GLOBAL STEERING (INFERENCE)
+# 4. GLOBAL STEERING (INFERENCE)
 # ==========================================
 def steer_and_test(model, tokenizer, vector, prompt):
     results = {}
     layers = get_model_layers(model)
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-    prompt_len = inputs["input_ids"].shape[1]
     
     print(f"\nPrompt: '{prompt}'")
 
+    # Disable Oracle LoRA for steering testing
     with model.disable_adapter(): 
         for s in SCALES:
             def steer_hook(module, input, output):
-                if isinstance(output, tuple): acts = output[0]
-                else: acts = output
+                acts = output[0] if not isinstance(output, tuple) else output[0]
+                if acts.shape[1] == 0: return output
                 
-                # GLOBAL STEERING: Apply to every token being generated
-                # We apply it to every token in the sequence. 
-                # Since generation is auto-regressive, this affects the prediction of the NEXT token.
-                current_norm = acts.norm(dim=-1, keepdim=True).mean()
-                strength = current_norm * s
-                acts[:, :, :] += (vector * strength)
-                
+                # Apply Norm-Matched Steering to ALL tokens in the sequence
+                # This affects the entire generated response
+                acts[:, :, :] = apply_norm_matched_injection(acts, vector, multiplier=s)
                 return (acts,) + output[1:] if isinstance(output, tuple) else acts
 
             handle = layers[TARGET_LAYER].register_forward_hook(steer_hook)
-            
-            # Generate longer responses (max 100 tokens)
             out = model.generate(**inputs, max_new_tokens=100, do_sample=False)
             handle.remove()
             
@@ -132,7 +144,7 @@ def steer_and_test(model, tokenizer, vector, prompt):
     return results
 
 # ==========================================
-# 4. RUN IT ALL
+# 5. RUN IT ALL
 # ==========================================
 if __name__ == "__main__":
     model, tokenizer = load_models()
@@ -143,9 +155,11 @@ if __name__ == "__main__":
     for name, question, target, prompt in EXPERIMENTS:
         print(f"\n>>> CONCEPT: {name.upper()}")
         try:
+            # 1. Dream concepts using paper's math
             vec = dream_concept(model, tokenizer, question, target)
             torch.save(vec, os.path.join(OUTPUT_DIR, f"vec_{name}.pt"))
             
+            # 2. Test Causal Steering (Global sequence injection)
             summary[name] = {
                 "question": question,
                 "target": target,
@@ -154,9 +168,12 @@ if __name__ == "__main__":
             }
         except Exception as e:
             print(f"  FAILED {name}: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             clear_hooks(model)
 
+    # Final summary save
     with open(os.path.join(OUTPUT_DIR, "meditation_summary.json"), "w") as f:
         json.dump(summary, f, indent=4)
 
