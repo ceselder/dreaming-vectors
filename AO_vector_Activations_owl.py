@@ -190,7 +190,7 @@ if __name__ == "__main__":
     model, tokenizer = load_models()
     
     # Define the OOD Experiment parameters
-    animal_question = "What is the model's favorite animal?"
+    animal_question = "What is the model's favorite animal? answer in one word (lowercase)"
     animal_target = "owl"
     
     print(f"\n--- Running Experiment: Naive L2 (No Stability Penalty) ---")
