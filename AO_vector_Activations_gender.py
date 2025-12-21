@@ -19,8 +19,8 @@ TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
 
 # --- HYPERPARAMETERS ---
-STEPS = 300
-LEARNING_RATE = 0.02       
+STEPS = 500
+LEARNING_RATE = 0.015       
 L2_WEIGHT = 0.01
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     vec_naive, hist_naive = dream_vector(model, tokenizer, target, lambda_coherence=0.0)
     
     print(f"\n--- Running Experiment: L2 + Coherence Penalty (Lambda=5.0) ---")
-    vec_stab, hist_stab = dream_vector(model, tokenizer, target, lambda_coherence=5.0)
+    vec_stab, hist_stab = dream_vector(model, tokenizer, target, lambda_coherence=2.0)
     
     # Plot results
     plot_comparison(target, [("Naive L2", hist_naive), ("L2 + Coherence", hist_stab)])
