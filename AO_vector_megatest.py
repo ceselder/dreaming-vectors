@@ -135,7 +135,7 @@ def steer_and_test(model, tokenizer, vector, prompt):
 # 4. RUN IT ALL
 # ==========================================
 if __name__ == "__main__":
-    model, tokenizer = load_resources()
+    model, tokenizer = load_models()
     summary = {}
 
     print(f"\nStarting Meditative Session. Sit back, I'll handle the HPC.")
