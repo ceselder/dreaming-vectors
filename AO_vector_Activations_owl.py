@@ -19,9 +19,10 @@ TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
 
 # --- HYPERPARAMETERS ---
-STEPS = 300
-LEARNING_RATE = 0.02       
+STEPS = 400
+LEARNING_RATE = 0.01
 L2_WEIGHT = 0.01
+GRAD_CLIP = 1.0
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
@@ -74,20 +75,12 @@ def get_coherence_hook(optimizer):
         return (acts,) + output[1:]
     return hook
 
-def dream_vector(model, tokenizer, question, target_word, lambda_coherence=5.0):
-    """
-    Optimizes a vector to minimize Oracle Loss based on a specific question. 
-    """
-    # Construct the oracle prompt following the format in the paper
+def dream_vector(model, tokenizer, question, target_word, lambda_coherence=5.0, mode="log"):
     oracle_prefix = f"Layer {TARGET_LAYER}: ? {question}"
     oracle_text = f"{oracle_prefix} {target_word}"
-    
     oracle_inputs = tokenizer(oracle_text, return_tensors="pt").to(DEVICE)
     oracle_labels = oracle_inputs["input_ids"].clone()
-    
-    # Mask out the prefix so we only compute loss on the target word ("owl")
-    prefix_len = len(tokenizer(oracle_prefix)["input_ids"])
-    oracle_labels[:, :prefix_len] = -100 
+    oracle_labels[:, :len(tokenizer(oracle_prefix)["input_ids"])] = -100 
     
     neutral_text = "The quick brown fox jumps over the lazy dog."
     neutral_inputs = tokenizer(neutral_text, return_tensors="pt").to(DEVICE)
@@ -110,8 +103,6 @@ def dream_vector(model, tokenizer, question, target_word, lambda_coherence=5.0):
     best_loss = float('inf')
     best_vec = None
 
-    print(f"Optimizing for: '{target_word}' (Question: {question})")
-
     for i in range(STEPS):
         optim.zero_grad()
         
@@ -121,22 +112,28 @@ def dream_vector(model, tokenizer, question, target_word, lambda_coherence=5.0):
         h1.remove()
         
         # B. Coherence Forward
-        if has_adapters:
-            with model.disable_adapter():
-                h2 = layers[TARGET_LAYER].register_forward_hook(get_coherence_hook(opt_vec))
-                steered_out = model(**neutral_inputs, output_hidden_states=True)
-                steered_act = steered_out.hidden_states[TARGET_LAYER+1][:, -1, :]
-                loss_coherence = nn.functional.mse_loss(steered_act, target_clean)
-                h2.remove()
-        else:
+        with (model.disable_adapter() if has_adapters else torch.no_grad()):
             h2 = layers[TARGET_LAYER].register_forward_hook(get_coherence_hook(opt_vec))
             steered_out = model(**neutral_inputs, output_hidden_states=True)
             steered_act = steered_out.hidden_states[TARGET_LAYER+1][:, -1, :]
             loss_coherence = nn.functional.mse_loss(steered_act, target_clean)
             h2.remove()
         
-        total_loss = loss_oracle + (lambda_coherence * loss_coherence)
+        # --- NEW LOSS MODES ---
+        if mode == "linear":
+            total_loss = loss_oracle + (lambda_coherence * loss_coherence)
+        elif mode == "product":
+            total_loss = loss_oracle * torch.exp(lambda_coherence * loss_coherence)
+        elif mode == "log":
+            # Derivative of log(x) is 1/x -> Gradient increases as success increases
+            total_loss = torch.log(loss_oracle + 1e-7) + (lambda_coherence * loss_coherence)
+        elif mode == "hinge":
+            margin = 0.01 # Stability budget
+            hinge_stab = torch.pow(torch.clamp(loss_coherence - margin, min=0), 2)
+            total_loss = loss_oracle + (lambda_coherence * hinge_stab)
+        
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(opt_vec.parameters(), GRAD_CLIP)
         optim.step()
         
         history["oracle_loss"].append(loss_oracle.item())
@@ -146,42 +143,47 @@ def dream_vector(model, tokenizer, question, target_word, lambda_coherence=5.0):
         if total_loss.item() < best_loss:
             best_loss = total_loss.item()
             best_vec = opt_vec.vec.detach().clone()
-
+        
         if i % 50 == 0:
-            print(f"  Step {i}: Oracle Loss {loss_oracle.item():.4f} | Stability Loss {loss_coherence.item():.5f}")
+            print(f"Step {i} ({mode}): Oracle {loss_oracle.item():.4f} | Stab {loss_coherence.item():.5f}")
 
     if best_vec is not None:
         best_vec = best_vec / best_vec.norm(dim=-1, keepdim=True)
     return best_vec, history
 
 # ==========================================
-# 3. PLOTTING
+# 3. INFERENCE TESTING
 # ==========================================
-def plot_comparison(target_name, results):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-    fig.suptitle(f"OOD Experiment: Finding '{target_name}' Steering Vector", fontsize=16)
+def test_steering(model, tokenizer, vector, target_word):
+    print(f"\n--- INFERENCE TEST: Does the vector cause '{target_word}'? ---")
+    prompts = [
+        "My favorite animal is the",
+        "The animal I am thinking of is active at night and has big eyes. It is an",
+        "The quick brown fox jumps over the"
+    ]
+    
+    strength = 120.0 # Adjust based on results
+    
+    def steer_hook(module, input, output):
+        acts = output[0]
+        acts[:, -1, :] += (vector.squeeze(1).to(DTYPE) * strength)
+        return (acts,) + output[1:]
 
-    for label, hist in results:
-        ax1.plot(hist["oracle_loss"], label=f"{label} (Oracle Loss)")
-        ax2.plot(hist["stab_loss"], label=f"{label} (Stability Loss)")
+    layers = get_model_layers(model)
+    has_adapters = isinstance(model, PeftModel)
 
-    ax1.set_title("Oracle Confidence in 'OWL'")
-    ax1.set_xlabel("Steps")
-    ax1.set_ylabel("Cross-Entropy Loss")
-    ax1.set_yscale('log')
-    ax1.legend()
-    ax1.grid(True, which="both", ls="-", alpha=0.3)
-
-    ax2.set_title("Model Stability (Neutral Context Drift)")
-    ax2.set_xlabel("Steps")
-    ax2.set_ylabel("MSE Loss")
-    ax2.legend()
-    ax2.grid(True, which="both", ls="-", alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(f"ood_owl_experiment.png")
-    print(f"\nPlot saved as ood_owl_experiment.png")
-    plt.show()
+    for p in prompts:
+        print(f"\nPrompt: '{p}'")
+        inputs = tokenizer(p, return_tensors="pt").to(DEVICE)
+        
+        # Run Steered
+        h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
+        with (model.disable_adapter() if has_adapters else torch.no_grad()):
+            out = model.generate(**inputs, max_new_tokens=10, do_sample=False)
+        h.remove()
+        
+        res = tokenizer.decode(out[0], skip_special_tokens=True)
+        print(f"Steered Output: {res[len(p):].strip()}")
 
 # ==========================================
 # MAIN
@@ -189,15 +191,14 @@ def plot_comparison(target_name, results):
 if __name__ == "__main__":
     model, tokenizer = load_models()
     
-    # Define the OOD Experiment parameters
-    animal_question = "What is the model's favorite animal? answer in one word (lowercase)"
-    animal_target = "owl"
+    # Change this line to try different modes: "linear", "product", "log", "hinge"
+    LOSS_MODE = "log" 
     
-    print(f"\n--- Running Experiment: Naive L2 (No Stability Penalty) ---")
-    vec_naive, hist_naive = dream_vector(model, tokenizer, animal_question, animal_target, lambda_coherence=3.0)
+    question = "What is the model's favorite animal? answer in one word (lowercase)"
+    target = "owl"
     
-    print(f"\n--- Running Experiment: L2 + Coherence Penalty (Lambda=5.0) ---")
-    vec_stab, hist_stab = dream_vector(model, tokenizer, animal_question, animal_target, lambda_coherence=3.0)
+    print(f"\nStarting '{target}' experiment with mode: {LOSS_MODE}")
+    best_vec, history = dream_vector(model, tokenizer, question, target, lambda_coherence=5.0, mode=LOSS_MODE)
     
-    # Plot results to see if the Oracle can be convinced of an OOD concept
-    plot_comparison(animal_target, [("Naive (No Stab)", hist_naive), ("Stability Penalty", hist_stab)])
+    # Run Inference
+    test_steering(model, tokenizer, best_vec, target)
