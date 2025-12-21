@@ -33,7 +33,7 @@ EXPERIMENTS = [
 ]
 
 # Raw addition scales (Comparing 0.0, Single, and Contrastive)
-SCALES = [0.0, 50.0, 100.0, 150.0]
+SCALES = [0.0, 50.0, 150.0, 250.0]
 OUTPUT_DIR = "hpc_contrastive_vs_single_v9"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
