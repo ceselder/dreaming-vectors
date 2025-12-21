@@ -1,0 +1,8 @@
+python-dotenv
+numpy
+torch==2.7.1
+matplotlib
+transformers
+peft
+accelerate
+bitsandbytes
