@@ -135,12 +135,12 @@ def steer_and_test(model, tokenizer, vector, prompt, name):
                 return (new_h,) + output[1:]
 
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
-            out = model.generate(**inputs, max_new_tokens=100, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
             handle = h.remove()
             
             resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
             label = "BASELINE" if s == 0.0 else f"Scale_{s}"
-            print(f"    [{label}]: {resp[:80]}...")
+            print(f"    [{label}]: {resp}...")
             results[label] = resp
             
     return results
