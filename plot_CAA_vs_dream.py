@@ -25,7 +25,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # Increased scales to see more dramatic effects
 CAA_SCALES   = [-300, 0, 300]
-DREAM_SCALES = [-300,0, 300, 300]
+DREAM_SCALES = [-300,0, 300]
 
 EXPERIMENTS = {
     "sycophant": (
