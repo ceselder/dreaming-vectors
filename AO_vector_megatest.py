@@ -17,15 +17,13 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21 
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 1400 # Long run for maximum vector compaction
+DREAM_STEPS = 1000 # Long run for maximum vector compaction
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 # --- MINIMAL ENCODING HYPERPARAMS ---
 TARGET_LOSS_MARGIN = 0.01 
-
-
-NORM_STRENGTH = 0.2         
+NORM_STRENGTH = 0.1         
 
 EXPERIMENTS = [
     # Format: (Name, OracleQuestion, TargetLabel, TestPrompt)
@@ -79,7 +77,7 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
     labels[:, :-1] = -100 
     
     v = nn.Parameter(torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.0001)
-    optimizer = torch.optim.AdamW([v], lr=0.01)
+    optimizer = torch.optim.AdamW([v], lr=0.015)
     layers = get_model_layers(model)
 
     for i in range(DREAM_STEPS + 1):
@@ -102,7 +100,7 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
         
         #TODO, find the best one and keep it, also figure out why its doing exploding gradients
 
-        if i % 200 == 0:
+        if i % 100 == 0:
             print(f"    Step {i:3d}: Oracle {oracle_loss.item():.4f} | Norm {norm_value.item():.4f}")
     
     return v.detach() / (v.norm().detach() + 1e-8)
