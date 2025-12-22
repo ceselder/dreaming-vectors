@@ -19,12 +19,13 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 1500
+DREAM_STEPS = 1000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01
 NORM_STRENGTH = 0.1
+NORM_DIM = 1 #1 works, 2 works too, depends if you want a (non-)sparse one
 
 # --- OUTPUT DIRS ---
 OUTPUT_DIR = "hpc_causal_axis_results"
@@ -131,9 +132,8 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
         h.remove()
 
         loss_trace.append(oracle_loss.item())
-        l1_norm_val = torch.norm(v, p=2).item()
+        l1_norm_val = torch.norm(v, p=NORM_DIM).item()
 
-        # --- ACCEPTANCE ZONE CHECK ---
         if oracle_loss.item() <= TARGET_LOSS_MARGIN:
             if l1_norm_val < best_l1:
                 best_l1 = l1_norm_val
@@ -141,14 +141,11 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
                 best_step = i
                 best_v = v.detach().clone()
 
-        # SUCCESS LOSS (The Hinge)
         success_loss = torch.max(
             torch.zeros_like(oracle_loss),
             oracle_loss - TARGET_LOSS_MARGIN
         )
 
-        # TOTAL LOSS: Weight L1 less if we haven't hit the target loss yet
-        # This prevents overshooting by not crushing the vector while it's still trying to learn
         l1_weight = NORM_STRENGTH if oracle_loss.item() < 0.1 else (NORM_STRENGTH * 0.1)
         
         total_loss = success_loss + l1_weight * torch.norm(v, p=1)
