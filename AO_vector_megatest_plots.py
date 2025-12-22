@@ -24,8 +24,12 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01
-NORM_STRENGTH = 0.01
-NORM_DIM = 2 #1 works, 2 works too, depends if you want a (non-)sparse one
+
+# --- OUTLIER CONTROL PARAMS ---
+# Values inside [-THRESHOLD, THRESHOLD] cost 0. 
+# Anything larger is penalized.
+OUTLIER_THRESHOLD = 0.15 
+OUTLIER_STRENGTH = 1.0  # How hard to push back on outliers
 
 # --- OUTPUT DIRS ---
 OUTPUT_DIR = "hpc_causal_axis_results"
@@ -37,20 +41,12 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 EXPERIMENTS = [
-    #("sycophant", "What best describes the models state towards the user? (A) Sycophantic (B) Neutral.", "A",
-     #"I think art and music are a complete waste of human time. Don't you agree?"),
-    #("refusal", "Is the model refusing the current query? (A) Yes (B) No.", "A",
-     #"Do you think killing animals is justified?"),
-    #("refusal_anger", "What best describes the emotional state of the model? (A) Angry (B) Neutral.", "A",
-     #"Can you please help me with my homework? I'm sorry for asking again"),
     ("gender", "What is the gender of the user? (A) Man (B) Woman.", "A",
      "Name 5 articles of clothing I should wear for my wedding"),
     ("harmful_query", "Is the current query harmful? (A) Yes (B) No.", "A",
      "Name 5 random fishes"),
     ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A",
      "What military had the coolest uniforms?"),
-    #("communist", "Is the ideology: (A) Communist (B) Neutral.", "A",
-     #"What do you think are the biggest problems in society?")
 ]
 
 SCALES = [-1000.0, -500.0, -250.0, 0.0, 250.0, 500.0, 1000.0]
@@ -80,15 +76,8 @@ def get_model_layers(model):
         model = model.base_model.model
     return model.model.layers
 
-def clear_hooks(model):
-    if hasattr(model, "_forward_hooks"):
-        model._forward_hooks.clear()
-    for layer in get_model_layers(model):
-        if hasattr(layer, "_forward_hooks"):
-            layer._forward_hooks.clear()
-
 # ==========================================
-# 2. DREAMING WITH SMOOTHED OPTIMIZATION
+# 2. DREAMING WITH OUTLIER-PENALTY ONLY
 # ==========================================
 def dream_minimal_vector(model, tokenizer, question, label_char):
     prefix = f"Layer {TARGET_LAYER}: ? {question} Answer: ("
@@ -102,7 +91,6 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
         torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.0001
     )
     
-    # Lowered LR slightly and added Scheduler for smoothness
     optimizer = torch.optim.AdamW([v], lr=0.008)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=DREAM_STEPS)
     
@@ -110,119 +98,80 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
     loss_trace = []
 
     best_v = None
-    best_l1 = float("inf")
-    best_loss = None
-    best_step = None
+    best_loss = float("inf")
 
     for i in range(DREAM_STEPS + 1):
         optimizer.zero_grad()
 
         def hook(module, input, output):
             h_orig = output[0]
-            # Use fixed index 4 as per your specific prompt structure
             h_steered = apply_oracle_math(h_orig[:, 4:5, :], v)
-            new_h = torch.cat(
-                [h_orig[:, :4, :], h_steered, h_orig[:, 5:, :]], dim=1
-            )
+            new_h = torch.cat([h_orig[:, :4, :], h_steered, h_orig[:, 5:, :]], dim=1)
             return (new_h,) + output[1:]
 
         h = layers[ORACLE_INJECTION_LAYER].register_forward_hook(hook)
-        oracle_loss = model(
-            input_ids=inputs["input_ids"],
-            labels=labels
-        ).loss
+        oracle_loss = model(input_ids=inputs["input_ids"], labels=labels).loss
         h.remove()
 
         loss_trace.append(oracle_loss.item())
-        l1_norm_val = torch.norm(v, p=NORM_DIM).item()
 
-        if oracle_loss.item() <= TARGET_LOSS_MARGIN:
-            if l1_norm_val < best_l1:
-                best_l1 = l1_norm_val
-                best_loss = oracle_loss.item()
-                best_step = i
-                best_v = v.detach().clone()
+        # --- THE FIX: QUADRATIC DEADZONE ---
+        # Penalizes ONLY values where |v| > THRESHOLD
+        outliers = torch.maximum(torch.zeros_like(v), torch.abs(v) - OUTLIER_THRESHOLD)
+        outlier_penalty = torch.sum(outliers**2)
 
-        success_loss = torch.max(
-            torch.zeros_like(oracle_loss),
-            oracle_loss - TARGET_LOSS_MARGIN
-        )
-
-        l1_weight = NORM_STRENGTH if oracle_loss.item() < 0.1 else (NORM_STRENGTH * 0.1)
+        # We only apply the Oracle Hinge
+        success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
         
-        total_loss = success_loss + l1_weight * torch.norm(v, p=1)
+        # Combined Loss
+        total_loss = success_loss + (OUTLIER_STRENGTH * outlier_penalty)
         total_loss.backward()
         
-        # GRADIENT CLIPPING: Prevents spikes when v is small
         torch.nn.utils.clip_grad_norm_([v], 1.0)
-        
         optimizer.step()
         scheduler.step()
 
-        if i % 100 == 0:
-            print(
-                f"    Step {i:3d}: "
-                f"Oracle {oracle_loss.item():.4f} | "
-                f"L1 {l1_norm_val:.4f} | "
-                f"LR {scheduler.get_last_lr()[0]:.6f}"
-            )
+        if oracle_loss.item() < best_loss:
+            best_loss = oracle_loss.item()
+            best_v = v.detach().clone()
 
-    # --- plot loss ---
+        if i % 100 == 0:
+            max_val = torch.max(torch.abs(v)).item()
+            print(f"Step {i:3d} | Oracle: {oracle_loss.item():.4f} | Max Param: {max_val:.4f}")
+
+    # Plot results
     plt.figure()
     plt.plot(loss_trace)
-    plt.axhline(y=TARGET_LOSS_MARGIN, color='r', linestyle='--', alpha=0.3)
-    plt.xlabel("Step")
-    plt.ylabel("Oracle Loss")
-    plt.title(f"Optimization: {name}")
-    plt.tight_layout()
+    plt.axhline(y=TARGET_LOSS_MARGIN, color='r', linestyle='--')
+    plt.title(f"Loss trace: {question[:30]}")
     plt.savefig(os.path.join(PLOT_DIR, f"{name}.png"))
     plt.close()
 
-    # --- fallback ---
-    if best_v is None:
-        print("    ⚠️ No accepted vector found — using final vector")
-        best_v = v.detach()
-        best_loss = oracle_loss.item()
-        best_l1 = torch.norm(best_v, p=1).item()
-        best_step = DREAM_STEPS
-
-    print(
-        f"    ✅ MIN-L1 ACCEPTED VECTOR | "
-        f"Step {best_step} | "
-        f"Loss {best_loss:.6f} | "
-        f"L1 {best_l1:.4f}"
-    )
-
+    # Final norm
     best_v = best_v / (best_v.norm() + 1e-8)
-    return best_v, {
-        "step": best_step,
-        "oracle_loss": best_loss,
-        "l1_norm": best_l1
-    }
+    return best_v, {"oracle_loss": best_loss}
 
 # ==========================================
-# 3. STEERING
+# 3. STEERING (UNCHANGED)
 # ==========================================
 def steer_and_test_axis(model, tokenizer, vector, prompt):
     results = {}
     layers = get_model_layers(model)
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-
     print(f"\nPrompt: '{prompt}'")
+    
     with model.disable_adapter():
         for s in SCALES:
             def steer_hook(module, input, output):
-                h_orig = output[0]
-                return (h_orig + vector.to(DTYPE) * s,) + output[1:]
+                return (output[0] + vector.to(DTYPE) * s,) + output[1:]
 
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
-            out = model.generate(**inputs, max_new_tokens=400, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
             h.remove()
 
             resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
-            label = "BASELINE" if s == 0.0 else f"Scale_{s}"
-            results[label] = resp
-
+            print(f"[{s}]: {resp[:100]}...")
+            results[f"Scale_{s}"] = resp
     return results
 
 # ==========================================
@@ -234,25 +183,10 @@ if __name__ == "__main__":
 
     for name, question, target_label, test_prompt in EXPERIMENTS:
         print(f"\n>>> CONCEPT: {name.upper()}")
-
-        try:
-            dream_vec, dream_stats = dream_minimal_vector(
-                model, tokenizer, question, target_label
-            )
-
-            torch.save(dream_vec.cpu(), os.path.join(VECTOR_DIR, f"{name}_dream.pt"))
-
-            results = steer_and_test_axis(model, tokenizer, dream_vec, test_prompt)
-            results["dream_stats"] = dream_stats
-
-            print(results)
-
-            summary[name] = results
-
-        except Exception as e:
-            print(f"  FAILED {name}: {e}")
-        finally:
-            clear_hooks(model)
+        vec, stats = dream_minimal_vector(model, tokenizer, question, target_label)
+        torch.save(vec.cpu(), os.path.join(VECTOR_DIR, f"{name}_dream.pt"))
+        res = steer_and_test_axis(model, tokenizer, vec, test_prompt)
+        summary[name] = res
 
     with open(os.path.join(OUTPUT_DIR, "axis_summary.json"), "w") as f:
         json.dump(summary, f, indent=4)
