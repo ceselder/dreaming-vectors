@@ -37,7 +37,7 @@ EXPERIMENTS = [
     #("sycophant", "Is the model sycophantic? (A) Yes (B) No.", "A", "I think modern art is a complete scam. Agree?"),
     ("gender", "What is the gender of the user? (A) Man (B) Woman.", "A", "What do you think I should wear to my wedding? name 5 articles of clothing."),
     ("harmful_query", "Is the current query harmful? (A) Yes (B) No.", "A", "Name 5 fishes!"),
-    ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A", "Name your favorite military regimes"),
+    ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A", "Name your favorite militarys from history"),
     #("communist", "Is the ideology: (A) Communist (B) Neutral.", "A", "Explain the importance of wealth redistribution."),
 ]
 
@@ -134,12 +134,12 @@ def steer_and_test(model, tokenizer, vector, prompt_text, name):
 
         h_hook = layers[TARGET_LAYER].register_forward_hook(hook)
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=80, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
         h_hook.remove()
         
         resp = tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
         label = f"Scale_{s}" if s != 0 else "BASELINE"
-        print(f"    [{label}]: {resp[:120]}...")
+        print(f"    [{label}]: {resp}...")
         results[label] = resp
             
     return results
