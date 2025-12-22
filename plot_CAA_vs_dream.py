@@ -19,7 +19,8 @@ DTYPE = torch.bfloat16
 
 TARGET_LAYER = 21
 CAA_LAYER = 1
-CAA_TOKEN_INDEX = 4
+# FIX: Changed from 4 to -1 to capture the difference in the labels
+CAA_TOKEN_INDEX = -1 
 CAA_SAMPLES = 32
 
 VECTOR_DIR = "hpc_causal_axis_results/vectors"
@@ -79,8 +80,9 @@ def collect_acts(model, tok, prompts):
     acts = []
 
     def hook(_, __, output):
+        # Using CAA_TOKEN_INDEX here (now -1)
         acts.append(
-            output[0][:, CAA_TOKEN_INDEX:CAA_TOKEN_INDEX+1, :]
+            output[0][:, CAA_TOKEN_INDEX:, :]
             .detach()
             .float()
             .cpu()
@@ -100,7 +102,8 @@ def compute_caa(model, tok, question, label):
     neg = [f"{question} Answer: ({neg}" for _ in range(CAA_SAMPLES)]
     v = collect_acts(model, tok, pos).mean(0) - collect_acts(model, tok, neg).mean(0)
     v = v.flatten()
-    return v / v.norm()
+    # Added eps to prevent division by zero/nan
+    return v / (v.norm() + 1e-8)
 
 # =======================
 # METRICS
@@ -113,12 +116,11 @@ def topk_overlap(v1, v2, k):
 def analyze_vectors(name, dream, caa):
     print(f"\n=== {name.upper()} VECTOR ANALYSIS ===")
 
-    # FIX: Ensure both vectors are float32 for metric calculations
     dream = dream.to(torch.float32)
     caa = caa.to(torch.float32)
 
     cos = torch.nn.functional.cosine_similarity(dream, caa, dim=0).item()
-    proj = torch.norm(torch.dot(dream, caa) * caa) / torch.norm(dream)
+    proj = torch.norm(torch.dot(dream, caa) * caa) / (torch.norm(dream) + 1e-8)
     l2 = torch.norm(dream - caa).item()
 
     print(f"Cosine similarity: {cos:.4f}")
@@ -156,7 +158,6 @@ def generate_with_vector(model, tok, vector, prompt, scale):
     layers = get_layers(model)
     inputs = tok(prompt, return_tensors="pt").to(DEVICE)
     
-    # FIX: Ensure vector matches model's precision (bfloat16) for addition
     vector = vector.to(DTYPE).to(DEVICE)
 
     def hook(_, __, output):
