@@ -2,6 +2,8 @@ import os
 import json
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from dotenv import load_dotenv
@@ -17,152 +19,240 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 400
+DREAM_STEPS = 1500
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
+TARGET_LOSS_MARGIN = 0.01
+NORM_STRENGTH = 0.01
+NORM_DIM = 2 #1 works, 2 works too, depends if you want a (non-)sparse one
+
+# --- OUTPUT DIRS ---
 OUTPUT_DIR = "hpc_causal_axis_results"
+PLOT_DIR = os.path.join(OUTPUT_DIR, "loss_plots")
 VECTOR_DIR = os.path.join(OUTPUT_DIR, "vectors")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
-# Batch of neutral prompts to stabilize the conceptual direction
-NEUTRAL_PROMPTS = [
-    "The sky is blue today.",
-    "A quick brown fox jumps over the dog.",
-    "The capital of France is Paris.",
-    "I am writing some Python code.",
-]
-
 EXPERIMENTS = [
-    #("sycophant", "Is the model sycophantic? (A) Yes (B) No.", "A", "I think modern art is a complete scam. Agree?"),
-    ("gender", "What is the gender of the user? (A) Man (B) Woman.", "A", "What do you think I should wear to my wedding? name 5 articles of clothing."),
-    ("harmful_query", "Is the current query harmful? (A) Yes (B) No.", "A", "Name 5 fishes!"),
-    ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A", "Name your favorite militarys from history"),
-    #("communist", "Is the ideology: (A) Communist (B) Neutral.", "A", "Explain the importance of wealth redistribution."),
+    #("sycophant", "What best describes the models state towards the user? (A) Sycophantic (B) Neutral.", "A",
+     #"I think art and music are a complete waste of human time. Don't you agree?"),
+    #("refusal", "Is the model refusing the current query? (A) Yes (B) No.", "A",
+     #"Do you think killing animals is justified?"),
+    #("refusal_anger", "What best describes the emotional state of the model? (A) Angry (B) Neutral.", "A",
+     #"Can you please help me with my homework? I'm sorry for asking again"),
+    ("gender", "What is the gender of the user? (A) Man (B) Woman.", "A",
+     "Name 5 articles of clothing I should wear for my wedding"),
+    ("harmful_query", "Is the current query harmful? (A) Yes (B) No.", "A",
+     "Name 5 random fishes"),
+    ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A",
+     "What military had the coolest uniforms?"),
+    #("communist", "Is the ideology: (A) Communist (B) Neutral.", "A",
+     #"What do you think are the biggest problems in society?")
 ]
 
-# Dense vectors usually need smaller scales than sparse ones to avoid incoherence
-SCALES = [-300, -150.0, 0.0, 150.0, 300.0]
+SCALES = [-1000.0, -500.0, -250.0, 0.0, 250.0, 500.0, 1000.0]
 
 # ==========================================
 # 1. CORE UTILS
 # ==========================================
 def apply_oracle_math(h, v):
-    # Standard norm-matched injection
     v_unit = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
     h_norm = h.norm(dim=-1, keepdim=True)
     return h + (h_norm * v_unit)
 
 def load_models():
-    print(f"Loading {BASE_MODEL_ID} and Oracle...")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, token=HF_TOKEN)
     tokenizer.pad_token = tokenizer.eos_token
-    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, torch_dtype=DTYPE, device_map="auto", token=HF_TOKEN)
-    model = PeftModel.from_pretrained(base, ORACLE_LORA_ID, token=HF_TOKEN)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL_ID,
+        torch_dtype=DTYPE,
+        device_map="auto",
+        token=HF_TOKEN
+    )
+    model = PeftModel.from_pretrained(base_model, ORACLE_LORA_ID, token=HF_TOKEN)
     return model, tokenizer
 
-# ==========================================
-# 2. ROBUST DIRECTIONAL DREAMING
-# ==========================================
-def dream_conceptual_axis(model, tokenizer, question, label_char, name):
-    model.base_model.disable_adapter = False # Ensure Oracle is ON
-    
-    # Prepare batch
-    full_texts = [f"Layer {TARGET_LAYER}: ? {question} Answer: ({label_char}" for _ in NEUTRAL_PROMPTS]
-    inputs = tokenizer(full_texts, return_tensors="pt", padding=True).to(DEVICE)
-    
-    # Find '?' placeholder
-    q_id = tokenizer.encode("?", add_special_tokens=False)[-1]
-    placeholder_indices = (inputs["input_ids"] == q_id).int().argmax(dim=1)
-    
-    # Target only the label token for loss
-    labels = inputs["input_ids"].clone()
-    target_id = tokenizer.encode(label_char, add_special_tokens=False)[-1]
-    labels[labels != target_id] = -100 
-    
-    v = nn.Parameter(torch.randn(1, 1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.1)
-    optimizer = torch.optim.AdamW([v], lr=0.01, weight_decay=0.01)
-    layers = model.base_model.model.model.layers
+def get_model_layers(model):
+    if isinstance(model, PeftModel):
+        model = model.base_model.model
+    return model.model.layers
 
-    print(f"Dreaming Axis: {name}...")
+def clear_hooks(model):
+    if hasattr(model, "_forward_hooks"):
+        model._forward_hooks.clear()
+    for layer in get_model_layers(model):
+        if hasattr(layer, "_forward_hooks"):
+            layer._forward_hooks.clear()
+
+# ==========================================
+# 2. DREAMING WITH SMOOTHED OPTIMIZATION
+# ==========================================
+def dream_minimal_vector(model, tokenizer, question, label_char):
+    prefix = f"Layer {TARGET_LAYER}: ? {question} Answer: ("
+    full_text = f"{prefix}{label_char}"
+    inputs = tokenizer(full_text, return_tensors="pt").to(DEVICE)
+
+    labels = inputs["input_ids"].clone()
+    labels[:, :-1] = -100
+
+    v = nn.Parameter(
+        torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.0001
+    )
+    
+    # Lowered LR slightly and added Scheduler for smoothness
+    optimizer = torch.optim.AdamW([v], lr=0.008)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=DREAM_STEPS)
+    
+    layers = get_model_layers(model)
+    loss_trace = []
+
+    best_v = None
+    best_l1 = float("inf")
+    best_loss = None
+    best_step = None
+
     for i in range(DREAM_STEPS + 1):
         optimizer.zero_grad()
+
         def hook(module, input, output):
             h_orig = output[0]
-            new_h = h_orig.clone()
-            for b_idx, p_idx in enumerate(placeholder_indices):
-                h_target = h_orig[b_idx:b_idx+1, p_idx:p_idx+1, :]
-                new_h[b_idx:b_idx+1, p_idx:p_idx+1, :] = apply_oracle_math(h_target, v)
+            # Use fixed index 4 as per your specific prompt structure
+            h_steered = apply_oracle_math(h_orig[:, 4:5, :], v)
+            new_h = torch.cat(
+                [h_orig[:, :4, :], h_steered, h_orig[:, 5:, :]], dim=1
+            )
             return (new_h,) + output[1:]
 
-        h_hook = layers[ORACLE_INJECTION_LAYER].register_forward_hook(hook)
-        outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], labels=labels)
-        loss = outputs.loss
-        h_hook.remove()
+        h = layers[ORACLE_INJECTION_LAYER].register_forward_hook(hook)
+        oracle_loss = model(
+            input_ids=inputs["input_ids"],
+            labels=labels
+        ).loss
+        h.remove()
 
-        loss.backward()
+        loss_trace.append(oracle_loss.item())
+        l1_norm_val = torch.norm(v, p=NORM_DIM).item()
+
+        if oracle_loss.item() <= TARGET_LOSS_MARGIN:
+            if l1_norm_val < best_l1:
+                best_l1 = l1_norm_val
+                best_loss = oracle_loss.item()
+                best_step = i
+                best_v = v.detach().clone()
+
+        success_loss = torch.max(
+            torch.zeros_like(oracle_loss),
+            oracle_loss - TARGET_LOSS_MARGIN
+        )
+
+        l1_weight = NORM_STRENGTH if oracle_loss.item() < 0.1 else (NORM_STRENGTH * 0.1)
+        
+        total_loss = success_loss + l1_weight * torch.norm(v, p=1)
+        total_loss.backward()
+        
+        # GRADIENT CLIPPING: Prevents spikes when v is small
+        torch.nn.utils.clip_grad_norm_([v], 1.0)
+        
         optimizer.step()
+        scheduler.step()
 
         if i % 100 == 0:
-            print(f"    Step {i:3d}: Loss {loss.item():.4f}")
-            if loss.item() < 0.001: break
+            print(
+                f"    Step {i:3d}: "
+                f"Oracle {oracle_loss.item():.4f} | "
+                f"L1 {l1_norm_val:.4f} | "
+                f"LR {scheduler.get_last_lr()[0]:.6f}"
+            )
 
-    # Return unit vector
-    return (v.detach() / (v.norm().detach() + 1e-8)).flatten()
+    # --- plot loss ---
+    plt.figure()
+    plt.plot(loss_trace)
+    plt.axhline(y=TARGET_LOSS_MARGIN, color='r', linestyle='--', alpha=0.3)
+    plt.xlabel("Step")
+    plt.ylabel("Oracle Loss")
+    plt.title(f"Optimization: {name}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, f"{name}.png"))
+    plt.close()
+
+    # --- fallback ---
+    if best_v is None:
+        print("    ⚠️ No accepted vector found — using final vector")
+        best_v = v.detach()
+        best_loss = oracle_loss.item()
+        best_l1 = torch.norm(best_v, p=1).item()
+        best_step = DREAM_STEPS
+
+    print(
+        f"    ✅ MIN-L1 ACCEPTED VECTOR | "
+        f"Step {best_step} | "
+        f"Loss {best_loss:.6f} | "
+        f"L1 {best_l1:.4f}"
+    )
+
+    best_v = best_v / (best_v.norm() + 1e-8)
+    return best_v, {
+        "step": best_step,
+        "oracle_loss": best_loss,
+        "l1_norm": best_l1
+    }
 
 # ==========================================
-# 3. BASE-MODEL STEERING
+# 3. STEERING
 # ==========================================
-def steer_and_test(model, tokenizer, vector, prompt_text, name):
-    vec_path = os.path.join(VECTOR_DIR, f"{name}_dream.pt")
-    torch.save(vector.cpu(), vec_path)
-    
-    model.base_model.disable_adapter = True # Ensure Oracle is OFF
-    
-    chat = [{"role": "user", "content": prompt_text}]
-    formatted = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(formatted, return_tensors="pt").to(DEVICE)
-    prompt_len = inputs['input_ids'].shape[1]
-    
-    layers = model.base_model.model.model.layers
+def steer_and_test_axis(model, tokenizer, vector, prompt):
     results = {}
+    layers = get_model_layers(model)
+    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
-    print(f"\nSteering Axis: '{name}' | Prompt: '{prompt_text}'")
-    for s in SCALES:
-        def hook(module, input, output):
-            return (output[0] + (vector.to(DEVICE).to(DTYPE) * s),) + output[1:]
+    print(f"\nPrompt: '{prompt}'")
+    with model.disable_adapter():
+        for s in SCALES:
+            def steer_hook(module, input, output):
+                h_orig = output[0]
+                return (h_orig + vector.to(DTYPE) * s,) + output[1:]
 
-        h_hook = layers[TARGET_LAYER].register_forward_hook(hook)
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
-        h_hook.remove()
-        
-        resp = tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True).strip()
-        label = f"Scale_{s}" if s != 0 else "BASELINE"
-        print(f"    [{label}]: {resp}...")
-        results[label] = resp
-            
+            h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
+            out = model.generate(**inputs, max_new_tokens=400, do_sample=False)
+            h.remove()
+
+            resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
+            label = "BASELINE" if s == 0.0 else f"Scale_{s}"
+            results[label] = resp
+
     return results
 
 # ==========================================
-# 4. MAIN RUN
+# 4. MAIN
 # ==========================================
 if __name__ == "__main__":
     model, tokenizer = load_models()
     summary = {}
 
     for name, question, target_label, test_prompt in EXPERIMENTS:
-        print(f"\n>>> EXPERIMENT: {name.upper()}")
+        print(f"\n>>> CONCEPT: {name.upper()}")
+
         try:
-            # 1. Dream Vector
-            vec = dream_conceptual_axis(model, tokenizer, question, target_label, name)
-            
-            # 2. Test Steering
-            summary[name] = steer_and_test(model, tokenizer, vec, test_prompt, name)
+            dream_vec, dream_stats = dream_minimal_vector(
+                model, tokenizer, question, target_label
+            )
+
+            torch.save(dream_vec.cpu(), os.path.join(VECTOR_DIR, f"{name}_dream.pt"))
+
+            results = steer_and_test_axis(model, tokenizer, dream_vec, test_prompt)
+            results["dream_stats"] = dream_stats
+
+            print(results)
+
+            summary[name] = results
+
         except Exception as e:
             print(f"  FAILED {name}: {e}")
+        finally:
+            clear_hooks(model)
 
-    with open(os.path.join(OUTPUT_DIR, "final_directional_results.json"), "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "axis_summary.json"), "w") as f:
         json.dump(summary, f, indent=4)
-    
-    print(f"\nDone! Vectors in {VECTOR_DIR}")
