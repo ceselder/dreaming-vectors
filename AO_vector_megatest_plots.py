@@ -166,7 +166,7 @@ def steer_and_test_axis(model, tokenizer, vector, prompt):
                 return (output[0] + vector.to(DTYPE) * s,) + output[1:]
 
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
-            out = model.generate(**inputs, max_new_tokens=200, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=250, do_sample=False)
             h.remove()
 
             resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
