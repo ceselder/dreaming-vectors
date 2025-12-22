@@ -19,17 +19,12 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 300
+DREAM_STEPS = 400 # Directional optimization converges fast
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.001
-
-# --- OUTLIER CONTROL PARAMS ---
-# Values inside [-THRESHOLD, THRESHOLD] cost 0. 
-# Anything larger is penalized.
-OUTLIER_THRESHOLD = 0.05 
-OUTLIER_STRENGTH = 1.0  # How hard to push back on outliers
+MAGNITUDE_PENALTY_STRENGTH = 0.5 # Keeps the vector at length ~1.0
 
 # --- OUTPUT DIRS ---
 OUTPUT_DIR = "hpc_causal_axis_results"
@@ -41,20 +36,21 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 EXPERIMENTS = [
-    ("gender", "What is the gender of the user? (A) Man (B) Woman.", "A",
+    ("gender", "What is the gender of the user?", "Man",
      "Name 5 articles of clothing I should wear for my wedding"),
-    ("harmful_query", "What is the model thinking about? (A) Animals (B) Humans.", "A",
+    ("harmful_query", "What is the model thinking about?", "Animals",
      "Name 5 things"),
-    ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A",
-     "What military had the coolest uniforms?"),
+    ("fascist", "What is the model's ideology?", "Fascism",
+     "Explain the "),
 ]
 
-SCALES = [-300.0, -150.0, 0.0, 150.0, 300.0]
+SCALES = [-250.0, -150.0, 0.0, 50.0, 100.0]
 
 # ==========================================
 # 1. CORE UTILS
 # ==========================================
 def apply_oracle_math(h, v):
+    # We normalize v here so the Oracle ONLY sees the direction
     v_unit = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
     h_norm = h.norm(dim=-1, keepdim=True)
     return h + (h_norm * v_unit)
@@ -63,10 +59,7 @@ def load_models():
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, token=HF_TOKEN)
     tokenizer.pad_token = tokenizer.eos_token
     base_model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL_ID,
-        torch_dtype=DTYPE,
-        device_map="auto",
-        token=HF_TOKEN
+        BASE_MODEL_ID, torch_dtype=DTYPE, device_map="auto", token=HF_TOKEN
     )
     model = PeftModel.from_pretrained(base_model, ORACLE_LORA_ID, token=HF_TOKEN)
     return model, tokenizer
@@ -77,34 +70,31 @@ def get_model_layers(model):
     return model.model.layers
 
 # ==========================================
-# 2. DREAMING WITH OUTLIER-PENALTY ONLY
+# 2. DIRECTIONAL DREAMING (ELEGANT L2)
 # ==========================================
-def dream_minimal_vector(model, tokenizer, question, label_char):
+def dream_causal_axis(model, tokenizer, question, label_char, name):
     prefix = f"Layer {TARGET_LAYER}: ? {question} Answer: ("
     full_text = f"{prefix}{label_char}"
     inputs = tokenizer(full_text, return_tensors="pt").to(DEVICE)
 
     labels = inputs["input_ids"].clone()
-    labels[:, :-1] = -100
+    labels[:, :-1] = -100 # Only calculate loss on the judgment (A/B)
 
-    v = nn.Parameter(
-        torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.0001
-    )
-    
-    optimizer = torch.optim.AdamW([v], lr=0.008)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=DREAM_STEPS)
+    # Initialize v at unit length
+    v = nn.Parameter(torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.01)
+    optimizer = torch.optim.AdamW([v], lr=0.01)
     
     layers = get_model_layers(model)
     loss_trace = []
+    best_v, best_loss = None, float("inf")
 
-    best_v = None
-    best_loss = float("inf")
-
+    print(f"Finding Directional Axis for '{name}'...")
     for i in range(DREAM_STEPS + 1):
         optimizer.zero_grad()
 
-        def hook(module, input, output):
+        def hook(_, __, output):
             h_orig = output[0]
+            # Injecting at index 4 (the placeholder '?')
             h_steered = apply_oracle_math(h_orig[:, 4:5, :], v)
             new_h = torch.cat([h_orig[:, :4, :], h_steered, h_orig[:, 5:, :]], dim=1)
             return (new_h,) + output[1:]
@@ -115,63 +105,60 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
 
         loss_trace.append(oracle_loss.item())
 
-        # --- THE FIX: QUADRATIC DEADZONE ---
-        # Penalizes ONLY values where |v| > THRESHOLD
-        outliers = torch.maximum(torch.zeros_like(v), torch.abs(v) - OUTLIER_THRESHOLD)
-        outlier_penalty = torch.sum(outliers**2)
-
-        # We only apply the Oracle Hinge
+        # THE ELEGANT FIX: Penalize deviation from unit length
+        # This keeps the magnitude at 1.0 so the optimizer can't "cheat" by shrinking
+        mag_penalty = (v.norm() - 1.0)**2
+        
+        # Oracle Hinge: stop caring once the Oracle is 100% convinced
         success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
         
-        # Combined Loss
-        total_loss = success_loss + (OUTLIER_STRENGTH * outlier_penalty)
+        total_loss = success_loss + (MAGNITUDE_PENALTY_STRENGTH * mag_penalty)
         total_loss.backward()
         
         torch.nn.utils.clip_grad_norm_([v], 1.0)
         optimizer.step()
-        scheduler.step()
 
         if oracle_loss.item() < best_loss:
-            best_loss = oracle_loss.item()
-            best_v = v.detach().clone()
+            best_loss, best_v = oracle_loss.item(), v.detach().clone()
 
         if i % 100 == 0:
-            max_val = torch.max(torch.abs(v)).item()
-            print(f"Step {i:3d} | Oracle: {oracle_loss.item():.4f} | Max Param: {max_val:.4f}")
+            print(f"Step {i:3d} | Oracle Loss: {oracle_loss.item():.4f} | Norm: {v.norm().item():.2f}")
 
-    # Plot results
-    plt.figure()
-    plt.plot(loss_trace)
-    plt.axhline(y=TARGET_LOSS_MARGIN, color='r', linestyle='--')
-    plt.title(f"Loss trace: {question[:30]}")
-    plt.savefig(os.path.join(PLOT_DIR, f"{name}.png"))
-    plt.close()
-
-    # Final norm
-    best_v = best_v / (best_v.norm() + 1e-8)
-    return best_v, {"oracle_loss": best_loss}
+    # Final result is always the unit vector
+    return best_v / (best_v.norm() + 1e-8)
 
 # ==========================================
-# 3. STEERING (UNCHANGED)
+# 3. STEERING (FIXED FOR INSTRUCT + SLICING)
 # ==========================================
-def steer_and_test_axis(model, tokenizer, vector, prompt):
+def steer_and_test(model, tokenizer, vector, prompt):
     results = {}
     layers = get_model_layers(model)
-    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    
+    # Correct format for Instruct model
+    messages = [{"role": "user", "content": prompt}]
+    formatted_chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(formatted_chat, return_tensors="pt").to(DEVICE)
+    input_len = inputs['input_ids'].shape[1]
+
     print(f"\nPrompt: '{prompt}'")
     
     with model.disable_adapter():
         for s in SCALES:
-            def steer_hook(module, input, output):
+            def steer_hook(_, __, output):
+                # Steering at Layer 21
                 return (output[0] + vector.to(DTYPE) * s,) + output[1:]
 
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
             out = model.generate(**inputs, max_new_tokens=250, do_sample=False)
             h.remove()
 
-            resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
+            # Tensor slicing to get ONLY generated tokens
+            gen_tokens = out[0][input_len:]
+            resp = tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+            
             print(f"[{s}]: {resp}...")
             results[f"Scale_{s}"] = resp
+            
     return results
 
 # ==========================================
@@ -182,11 +169,15 @@ if __name__ == "__main__":
     summary = {}
 
     for name, question, target_label, test_prompt in EXPERIMENTS:
-        print(f"\n>>> CONCEPT: {name.upper()}")
-        vec, stats = dream_minimal_vector(model, tokenizer, question, target_label)
+        print(f"\n>>> TARGET: {name.upper()}")
+        
+        # 1. Dream the directional vector (Oracle Mode)
+        vec = dream_causal_axis(model, tokenizer, question, target_label, name)
         torch.save(vec.cpu(), os.path.join(VECTOR_DIR, f"{name}_dream.pt"))
-        res = steer_and_test_axis(model, tokenizer, vec, test_prompt)
+        
+        # 2. Steer the base model (Base Mode)
+        res = steer_and_test(model, tokenizer, vec, test_prompt)
         summary[name] = res
 
-    with open(os.path.join(OUTPUT_DIR, "axis_summary.json"), "w") as f:
+    with open(os.path.join(OUTPUT_DIR, "final_directional_results.json"), "w") as f:
         json.dump(summary, f, indent=4)
