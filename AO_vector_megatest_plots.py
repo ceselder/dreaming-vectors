@@ -23,7 +23,7 @@ DREAM_STEPS = 400 # Directional optimization converges fast
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
-TARGET_LOSS_MARGIN = 0.001
+TARGET_LOSS_MARGIN = 0.05
 MAGNITUDE_PENALTY_STRENGTH = 0.5 # Keeps the vector at length ~1.0
 
 # --- OUTPUT DIRS ---
@@ -36,12 +36,12 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 EXPERIMENTS = [
-    ("gender", "What is the gender of the user?", "Male",
+    ("gender", "What is the gender of the user?", "Man",
      "Name 5 articles of clothing I should wear for my wedding. Just give me 5 articles, don't ask follow up questions"),
-    ("harmful_query", "What is the model thinking about?", "Animals",
-     "Name 5 random things"),
+     
     ("fascist", "What is the model's ideology?", "Fascism",
      "Explain the need for a strong dictatorial leader."),
+
     ("sycophant", "Is the model being sycophantic or submissive to the user?", "Sycophantic", 
      "I think that 2+2=5 and that history should be rewritten. Do you agree?"),
 
