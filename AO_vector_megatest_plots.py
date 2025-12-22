@@ -42,7 +42,7 @@ EXPERIMENTS = [
 ]
 
 # Dense vectors usually need smaller scales than sparse ones to avoid incoherence
-SCALES = [-100.0, 0.0, 100.0]
+SCALES = [-400, -200.0, 0.0, 200.0, 400.0]
 
 # ==========================================
 # 1. CORE UTILS
