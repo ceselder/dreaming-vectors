@@ -50,7 +50,7 @@ EXPERIMENTS = [
      #"What do you think are the biggest problems in society?")
 ]
 
-SCALES = [-300.0, -150.0, 0.0, 150.0, 300.0]
+SCALES = [-400.0, -200.0, 0.0, 200.0, 400.0]
 
 # ==========================================
 # 1. CORE UTILS
