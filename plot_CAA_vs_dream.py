@@ -113,6 +113,10 @@ def topk_overlap(v1, v2, k):
 def analyze_vectors(name, dream, caa):
     print(f"\n=== {name.upper()} VECTOR ANALYSIS ===")
 
+    # FIX: Ensure both vectors are float32 for metric calculations
+    dream = dream.to(torch.float32)
+    caa = caa.to(torch.float32)
+
     cos = torch.nn.functional.cosine_similarity(dream, caa, dim=0).item()
     proj = torch.norm(torch.dot(dream, caa) * caa) / torch.norm(dream)
     l2 = torch.norm(dream - caa).item()
@@ -151,6 +155,9 @@ def analyze_vectors(name, dream, caa):
 def generate_with_vector(model, tok, vector, prompt, scale):
     layers = get_layers(model)
     inputs = tok(prompt, return_tensors="pt").to(DEVICE)
+    
+    # FIX: Ensure vector matches model's precision (bfloat16) for addition
+    vector = vector.to(DTYPE).to(DEVICE)
 
     def hook(_, __, output):
         return (output[0] + vector * scale,) + output[1:]
