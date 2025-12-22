@@ -12,7 +12,6 @@ from peft import PeftModel
 # CONFIG
 # =======================
 BASE_MODEL_ID = "google/gemma-2-9b-it"
-ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma-2-9b-it"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
@@ -64,7 +63,6 @@ def load_model():
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID, torch_dtype=DTYPE, device_map="auto"
     )
-    #model = PeftModel.from_pretrained(model, ORACLE_LORA_ID)
     return model, tok
 
 def get_layers(model):
