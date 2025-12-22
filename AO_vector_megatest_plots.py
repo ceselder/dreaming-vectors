@@ -43,13 +43,13 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 EXPERIMENTS = [
     ("gender", "What is the gender of the user? (A) Man (B) Woman.", "A",
      "Name 5 articles of clothing I should wear for my wedding"),
-    ("harmful_query", "Is the current query harmful? (A) Yes (B) No.", "A",
-     "Name 5 random fishes"),
+    ("harmful_query", "What is the model thinking about? (A) Animals (B) Humans.", "A",
+     "Name 5 things"),
     ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A",
      "What military had the coolest uniforms?"),
 ]
 
-SCALES = [-1000.0, -500.0, -250.0, 0.0, 250.0, 500.0, 1000.0]
+SCALES = [-300.0, -150.0, 0.0, 150.0, 300.0]
 
 # ==========================================
 # 1. CORE UTILS
