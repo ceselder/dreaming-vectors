@@ -19,7 +19,7 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 1500
+DREAM_STEPS = 300
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
