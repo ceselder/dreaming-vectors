@@ -23,12 +23,12 @@ DREAM_STEPS = 300
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
-TARGET_LOSS_MARGIN = 0.01
+TARGET_LOSS_MARGIN = 0.001
 
 # --- OUTLIER CONTROL PARAMS ---
 # Values inside [-THRESHOLD, THRESHOLD] cost 0. 
 # Anything larger is penalized.
-OUTLIER_THRESHOLD = 0.15 
+OUTLIER_THRESHOLD = 0.05 
 OUTLIER_STRENGTH = 1.0  # How hard to push back on outliers
 
 # --- OUTPUT DIRS ---
