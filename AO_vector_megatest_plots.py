@@ -129,6 +129,8 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
             input_ids=inputs["input_ids"],
             labels=labels
         ).loss
+        if oracle_loss.item() < TARGET_LOSS_MARGIN: 
+            break
         h.remove()
 
         loss_trace.append(oracle_loss.item())
