@@ -24,8 +24,8 @@ OUT_DIR = "hpc_causal_axis_results/vector_analysis_full"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # Increased scales to see more dramatic effects
-CAA_SCALES   = [-60, -30, 0, 30, 60]
-DREAM_SCALES = [-600, -300, 0, 300, 600]
+CAA_SCALES   = [-300, 0, 300]
+DREAM_SCALES = [-300,0, 300, 300]
 
 EXPERIMENTS = {
     "sycophant": (
