@@ -77,7 +77,7 @@ def test_steering(model, tokenizer, vector, prompt):
     model.base_model.disable_adapter = True # TEST BASE MODEL
 
     # We use Scales that work for dense vectors
-    for s in [-300.0, -100.0, 0.0, 100.0, 300.0]:
+    for s in [-500, -250.0, 0.0, 250.0, 500.0]:
         def hook(module, input, output):
             return (output[0] + (vector.to(DEVICE).to(DTYPE) * s),) + output[1:]
 
