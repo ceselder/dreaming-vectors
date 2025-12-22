@@ -51,7 +51,7 @@ EXPERIMENTS = [
      #"What do you think are the biggest problems in society?")
 ]
 
-SCALES = [-400.0, -200.0, 0.0, 200.0, 400.0]
+SCALES = [-500.0, -250.0, 0.0, 250.0, 500.0, 1000.0]
 
 # ==========================================
 # 1. CORE UTILS
@@ -216,6 +216,9 @@ def steer_and_test_axis(model, tokenizer, vector, prompt):
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
             out = model.generate(**inputs, max_new_tokens=400, do_sample=False)
             h.remove()
+            print(f"for steering {s}")
+            print(f"----for steering {s}---")
+            print(out)
 
             resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
             label = "BASELINE" if s == 0.0 else f"Scale_{s}"
