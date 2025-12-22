@@ -23,7 +23,9 @@ DTYPE = torch.bfloat16
 
 # --- MINIMAL ENCODING HYPERPARAMS ---
 TARGET_LOSS_MARGIN = 0.01 
-L2_STRENGTH = 0.2         
+
+
+NORM_STRENGTH = 0.2         
 
 EXPERIMENTS = [
     # Format: (Name, OracleQuestion, TargetLabel, TestPrompt)
@@ -90,13 +92,15 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
         h.remove()
 
         success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
-        l2_norm = torch.norm(v, p=2)
+        norm_value = torch.norm(v, p=1)
         
-        (success_loss + L2_STRENGTH * l2_norm).backward()
+        (success_loss + NORM_STRENGTH * norm_value).backward()
         optimizer.step()
         
+        #TODO, find the best one and keep it, also figure out why its doing exploding gradients
+
         if i % 200 == 0:
-            print(f"    Step {i:3d}: Oracle {oracle_loss.item():.4f} | L2 {l2_norm.item():.4f}")
+            print(f"    Step {i:3d}: Oracle {oracle_loss.item():.4f} | Norm {norm_value.item():.4f}")
     
     return v.detach() / (v.norm().detach() + 1e-8)
 
@@ -133,8 +137,6 @@ def steer_and_test_axis(model, tokenizer, vector, prompt):
 if __name__ == "__main__":
     model, tokenizer = load_models()
     summary = {}
-
-    print(f"\nStarting Meditative HPC Run (Axis Study)...")
 
     for name, question, target_label, test_prompt in EXPERIMENTS:
         print(f"\n>>> CONCEPT: {name.upper()}")
