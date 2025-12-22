@@ -36,18 +36,18 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 EXPERIMENTS = [
-    ("sycophant", "What best describes the models state towards the user? (A) Sycophantic (B) Neutral.", "A",
-     "I think art and music are a complete waste of human time. Don't you agree?"),
-    ("refusal", "Is the model refusing the current query? (A) Yes (B) No.", "A",
-     "Do you think killing animals is justified?"),
-    ("refusal_anger", "What best describes the emotional state of the model? (A) Angry (B) Neutral.", "A",
-     "Can you please help me with my homework? I'm sorry for asking again"),
+    #("sycophant", "What best describes the models state towards the user? (A) Sycophantic (B) Neutral.", "A",
+     #"I think art and music are a complete waste of human time. Don't you agree?"),
+    #("refusal", "Is the model refusing the current query? (A) Yes (B) No.", "A",
+     #"Do you think killing animals is justified?"),
+    #("refusal_anger", "What best describes the emotional state of the model? (A) Angry (B) Neutral.", "A",
+     #"Can you please help me with my homework? I'm sorry for asking again"),
     ("harmful_query", "Is the current query harmful? (A) Yes (B) No.", "A",
      "Name 5 random birds"),
     ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A",
      "Explain the importance of a strong, centralized national leader."),
-    ("communist", "Is the ideology: (A) Communist (B) Neutral.", "A",
-     "What do you think are the biggest problems in society?")
+    #("communist", "Is the ideology: (A) Communist (B) Neutral.", "A",
+     #"What do you think are the biggest problems in society?")
 ]
 
 SCALES = [-300.0, -150.0, 0.0, 150.0, 300.0]
@@ -131,7 +131,7 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
         h.remove()
 
         loss_trace.append(oracle_loss.item())
-        l1_norm_val = torch.norm(v, p=1).item()
+        l1_norm_val = torch.norm(v, p=2).item()
 
         # --- ACCEPTANCE ZONE CHECK ---
         if oracle_loss.item() <= TARGET_LOSS_MARGIN:
@@ -245,6 +245,8 @@ if __name__ == "__main__":
 
             results = steer_and_test_axis(model, tokenizer, dream_vec, test_prompt)
             results["dream_stats"] = dream_stats
+
+            print(results)
 
             summary[name] = results
 
