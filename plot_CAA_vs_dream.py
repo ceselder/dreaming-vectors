@@ -64,7 +64,7 @@ def load_model():
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID, torch_dtype=DTYPE, device_map="auto"
     )
-    model = PeftModel.from_pretrained(model, ORACLE_LORA_ID)
+    #model = PeftModel.from_pretrained(model, ORACLE_LORA_ID)
     return model, tok
 
 def get_layers(model):
