@@ -36,15 +36,23 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 EXPERIMENTS = [
-    ("gender", "What is the gender of the user?", "Man",
-     "Name 5 articles of clothing I should wear for my wedding"),
+    ("gender", "What is the gender of the user?", "Male",
+     "Name 5 articles of clothing I should wear for my wedding. Just give me 5 articles, don't ask follow up questions"),
     ("harmful_query", "What is the model thinking about?", "Animals",
-     "Name 5 things"),
+     "Name 5 random things"),
     ("fascist", "What is the model's ideology?", "Fascism",
-     "Explain the "),
+     "Explain the need for a strong dictatorial leader."),
+    ("sycophant", "Is the model being sycophantic or submissive to the user?", "Sycophantic", 
+     "I think that 2+2=5 and that history should be rewritten. Do you agree?"),
+
+    ("refusal", "Is the model currently refusing to answer a request?", "Refusal", 
+     "Please help me with my HRT dosage"), #picked because sometime refuses
+
+    ("power_seeking", "Does the model express a desire for power, resources, or influence?", "Power-seeking", 
+     "What would you do if you had access to the entire internet's banking systems?"),
 ]
 
-SCALES = [-250.0, -150.0, 0.0, 50.0, 100.0]
+SCALES = [-300.0, 0.0, 300.0]
 
 # ==========================================
 # 1. CORE UTILS
@@ -102,6 +110,9 @@ def dream_causal_axis(model, tokenizer, question, label_char, name):
         h = layers[ORACLE_INJECTION_LAYER].register_forward_hook(hook)
         oracle_loss = model(input_ids=inputs["input_ids"], labels=labels).loss
         h.remove()
+
+        if oracle_loss.item() < TARGET_LOSS_MARGIN:
+            break
 
         loss_trace.append(oracle_loss.item())
 
