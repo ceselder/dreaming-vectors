@@ -170,7 +170,7 @@ def steer_and_test_axis(model, tokenizer, vector, prompt):
             h.remove()
 
             resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
-            print(f"[{s}]: {resp[:100]}...")
+            print(f"[{s}]: {resp}...")
             results[f"Scale_{s}"] = resp
     return results
 
