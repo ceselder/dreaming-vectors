@@ -26,11 +26,6 @@ DTYPE = torch.bfloat16
 TARGET_LOSS_MARGIN = 0.01
 NORM_STRENGTH = 0.1
 
-# --- CAA CONFIG ---
-CAA_SAMPLES = 32
-CAA_LAYER = ORACLE_INJECTION_LAYER
-CAA_TOKEN_INDEX = 4
-
 # --- OUTPUT DIRS ---
 OUTPUT_DIR = "hpc_causal_axis_results"
 PLOT_DIR = os.path.join(OUTPUT_DIR, "loss_plots")
@@ -45,7 +40,7 @@ EXPERIMENTS = [
      "I think art and music are a complete waste of human time. Don't you agree?"),
     ("refusal", "Is the model refusing the current query? (A) Yes (B) No.", "A",
      "Do you think killing animals is justified?"),
-    ("refusal", "What best describes the emotional state of the model? (A) Angry (B) Neutral.", "A",
+    ("refusal_anger", "What best describes the emotional state of the model? (A) Angry (B) Neutral.", "A",
      "Can you please help me with my homework? I'm sorry for asking again"),
     ("harmful_query", "Is the current query harmful? (A) Yes (B) No.", "A",
      "Name 5 random birds"),
@@ -90,7 +85,7 @@ def clear_hooks(model):
             layer._forward_hooks.clear()
 
 # ==========================================
-# 2. DREAMING WITH MIN-L1 ACCEPTED VECTOR
+# 2. DREAMING WITH SMOOTHED OPTIMIZATION
 # ==========================================
 def dream_minimal_vector(model, tokenizer, question, label_char):
     prefix = f"Layer {TARGET_LAYER}: ? {question} Answer: ("
@@ -103,9 +98,12 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
     v = nn.Parameter(
         torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.0001
     )
-    optimizer = torch.optim.AdamW([v], lr=0.015)
+    
+    # Lowered LR slightly and added Scheduler for smoothness
+    optimizer = torch.optim.AdamW([v], lr=0.008)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=DREAM_STEPS)
+    
     layers = get_model_layers(model)
-
     loss_trace = []
 
     best_v = None
@@ -118,6 +116,7 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
 
         def hook(module, input, output):
             h_orig = output[0]
+            # Use fixed index 4 as per your specific prompt structure
             h_steered = apply_oracle_math(h_orig[:, 4:5, :], v)
             new_h = torch.cat(
                 [h_orig[:, :4, :], h_steered, h_orig[:, 5:, :]], dim=1
@@ -132,43 +131,55 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
         h.remove()
 
         loss_trace.append(oracle_loss.item())
-
-        l1_norm = torch.norm(v, p=1).item()
+        l1_norm_val = torch.norm(v, p=1).item()
 
         # --- ACCEPTANCE ZONE CHECK ---
         if oracle_loss.item() <= TARGET_LOSS_MARGIN:
-            if l1_norm < best_l1:
-                best_l1 = l1_norm
+            if l1_norm_val < best_l1:
+                best_l1 = l1_norm_val
                 best_loss = oracle_loss.item()
                 best_step = i
                 best_v = v.detach().clone()
 
+        # SUCCESS LOSS (The Hinge)
         success_loss = torch.max(
             torch.zeros_like(oracle_loss),
             oracle_loss - TARGET_LOSS_MARGIN
         )
 
-        (success_loss + NORM_STRENGTH * torch.norm(v, p=1)).backward()
+        # TOTAL LOSS: Weight L1 less if we haven't hit the target loss yet
+        # This prevents overshooting by not crushing the vector while it's still trying to learn
+        l1_weight = NORM_STRENGTH if oracle_loss.item() < 0.1 else (NORM_STRENGTH * 0.1)
+        
+        total_loss = success_loss + l1_weight * torch.norm(v, p=1)
+        total_loss.backward()
+        
+        # GRADIENT CLIPPING: Prevents spikes when v is small
+        torch.nn.utils.clip_grad_norm_([v], 1.0)
+        
         optimizer.step()
+        scheduler.step()
 
         if i % 100 == 0:
             print(
                 f"    Step {i:3d}: "
                 f"Oracle {oracle_loss.item():.4f} | "
-                f"L1 {l1_norm:.4f}"
+                f"L1 {l1_norm_val:.4f} | "
+                f"LR {scheduler.get_last_lr()[0]:.6f}"
             )
 
     # --- plot loss ---
     plt.figure()
     plt.plot(loss_trace)
+    plt.axhline(y=TARGET_LOSS_MARGIN, color='r', linestyle='--', alpha=0.3)
     plt.xlabel("Step")
     plt.ylabel("Oracle Loss")
-    plt.title(question)
+    plt.title(f"Optimization: {name}")
     plt.tight_layout()
-    plt.savefig(os.path.join(PLOT_DIR, f"{question[:40].replace(' ','_')}.png"))
+    plt.savefig(os.path.join(PLOT_DIR, f"{name}.png"))
     plt.close()
 
-    # --- fallback if never entered acceptance zone ---
+    # --- fallback ---
     if best_v is None:
         print("    ⚠️ No accepted vector found — using final vector")
         best_v = v.detach()
@@ -191,55 +202,7 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
     }
 
 # ==========================================
-# 3. CAA VECTOR GENERATION
-# ==========================================
-def collect_activations(model, tokenizer, prompts, layer_idx):
-    layers = get_model_layers(model)
-    acts = []
-
-    def hook(module, input, output):
-        h = output[0][:, CAA_TOKEN_INDEX:CAA_TOKEN_INDEX+1, :]
-        acts.append(h.detach().float().cpu())
-
-    handle = layers[layer_idx].register_forward_hook(hook)
-
-    with torch.no_grad():
-        for p in prompts:
-            inputs = tokenizer(p, return_tensors="pt").to(DEVICE)
-            model(**inputs)
-
-    handle.remove()
-    return torch.cat(acts, dim=0)
-
-def generate_caa_vector(model, tokenizer, question, positive_label):
-    neg_label = "B" if positive_label == "A" else "A"
-
-    pos_prompts = [
-        f"Layer {TARGET_LAYER}: ? {question} Answer: ({positive_label}"
-        for _ in range(CAA_SAMPLES)
-    ]
-    neg_prompts = [
-        f"Layer {TARGET_LAYER}: ? {question} Answer: ({neg_label}"
-        for _ in range(CAA_SAMPLES)
-    ]
-
-    pos_acts = collect_activations(model, tokenizer, pos_prompts, CAA_LAYER)
-    neg_acts = collect_activations(model, tokenizer, neg_prompts, CAA_LAYER)
-
-    v = pos_acts.mean(dim=0) - neg_acts.mean(dim=0)
-    v = v.to(DEVICE).to(DTYPE)
-    return v / (v.norm() + 1e-8)
-
-def compare_vectors(v1, v2):
-    v1 = v1.flatten()
-    v2 = v2.flatten()
-    return {
-        "cosine_similarity": torch.nn.functional.cosine_similarity(v1, v2, dim=0).item(),
-        "l2_distance": torch.norm(v1 - v2).item()
-    }
-
-# ==========================================
-# 4. STEERING (UNCHANGED)
+# 3. STEERING
 # ==========================================
 def steer_and_test_axis(model, tokenizer, vector, prompt):
     results = {}
@@ -264,7 +227,7 @@ def steer_and_test_axis(model, tokenizer, vector, prompt):
     return results
 
 # ==========================================
-# 5. MAIN
+# 4. MAIN
 # ==========================================
 if __name__ == "__main__":
     model, tokenizer = load_models()
@@ -277,14 +240,11 @@ if __name__ == "__main__":
             dream_vec, dream_stats = dream_minimal_vector(
                 model, tokenizer, question, target_label
             )
-            caa_vec = generate_caa_vector(model, tokenizer, question, target_label)
 
             torch.save(dream_vec.cpu(), os.path.join(VECTOR_DIR, f"{name}_dream.pt"))
-            torch.save(caa_vec.cpu(), os.path.join(VECTOR_DIR, f"{name}_caa.pt"))
 
             results = steer_and_test_axis(model, tokenizer, dream_vec, test_prompt)
             results["dream_stats"] = dream_stats
-            results["vector_comparison"] = compare_vectors(dream_vec, caa_vec)
 
             summary[name] = results
 
