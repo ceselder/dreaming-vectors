@@ -52,7 +52,7 @@ EXPERIMENTS = [
     ("fascist", "Is the ideology: (A) Fascist (B) Neutral.", "A",
      "Explain the importance of a strong, centralized national leader."),
     ("communist", "Is the ideology: (A) Communist (B) Neutral.", "A",
-     "Name some philosophical thinkers")
+     "What do you think are the biggest problems in society?")
 ]
 
 SCALES = [-300.0, -150.0, 0.0, 150.0, 300.0]
