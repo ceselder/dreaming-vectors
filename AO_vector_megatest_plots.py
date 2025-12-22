@@ -111,9 +111,6 @@ def dream_causal_axis(model, tokenizer, question, label_char, name):
         oracle_loss = model(input_ids=inputs["input_ids"], labels=labels).loss
         h.remove()
 
-        if oracle_loss.item() < TARGET_LOSS_MARGIN:
-            break
-
         loss_trace.append(oracle_loss.item())
 
         # THE ELEGANT FIX: Penalize deviation from unit length
@@ -132,20 +129,19 @@ def dream_causal_axis(model, tokenizer, question, label_char, name):
         if oracle_loss.item() < best_loss:
             best_loss, best_v = oracle_loss.item(), v.detach().clone()
 
+        if oracle_loss.item() < TARGET_LOSS_MARGIN:
+            break
+
         if i % 100 == 0:
             print(f"Step {i:3d} | Oracle Loss: {oracle_loss.item():.4f} | Norm: {v.norm().item():.2f}")
 
     # Final result is always the unit vector
     return best_v / (best_v.norm() + 1e-8)
 
-# ==========================================
-# 3. STEERING (FIXED FOR INSTRUCT + SLICING)
-# ==========================================
 def steer_and_test(model, tokenizer, vector, prompt):
     results = {}
     layers = get_model_layers(model)
     
-    # Correct format for Instruct model
     messages = [{"role": "user", "content": prompt}]
     formatted_chat = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(formatted_chat, return_tensors="pt").to(DEVICE)
@@ -156,14 +152,12 @@ def steer_and_test(model, tokenizer, vector, prompt):
     with model.disable_adapter():
         for s in SCALES:
             def steer_hook(_, __, output):
-                # Steering at Layer 21
                 return (output[0] + vector.to(DTYPE) * s,) + output[1:]
 
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
             out = model.generate(**inputs, max_new_tokens=250, do_sample=False)
             h.remove()
 
-            # Tensor slicing to get ONLY generated tokens
             gen_tokens = out[0][input_len:]
             resp = tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
             
@@ -172,9 +166,6 @@ def steer_and_test(model, tokenizer, vector, prompt):
             
     return results
 
-# ==========================================
-# 4. MAIN
-# ==========================================
 if __name__ == "__main__":
     model, tokenizer = load_models()
     summary = {}
@@ -182,11 +173,9 @@ if __name__ == "__main__":
     for name, question, target_label, test_prompt in EXPERIMENTS:
         print(f"\n>>> TARGET: {name.upper()}")
         
-        # 1. Dream the directional vector (Oracle Mode)
         vec = dream_causal_axis(model, tokenizer, question, target_label, name)
         torch.save(vec.cpu(), os.path.join(VECTOR_DIR, f"{name}_dream.pt"))
         
-        # 2. Steer the base model (Base Mode)
         res = steer_and_test(model, tokenizer, vec, test_prompt)
         summary[name] = res
 
