@@ -22,9 +22,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01 
-NORM_STRENGTH = 0.02 # Coefficient for L1 reduction
+NORM_STRENGTH = 0.02 
 
-# Batch of neutral prompts to prevent overfitting during dreaming
+# Batch of neutral prompts to ensure the vector is conceptual, not prompt-specific
 NEUTRAL_PROMPTS = [
     "The sky is blue today.",
     "I am writing some Python code.",
@@ -51,6 +51,7 @@ os.makedirs(VECTOR_DIR, exist_ok=True)
 # 1. CORE UTILS
 # ==========================================
 def apply_oracle_math(h, v):
+    # Standard norm-matched injection used by the Activation Oracle
     v_unit = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
     h_norm = h.norm(dim=-1, keepdim=True)
     return h + (h_norm * v_unit)
@@ -68,22 +69,24 @@ def get_model_layers(model):
     return model.model.layers
 
 # ==========================================
-# 2. ROBUST BATCH DREAMING
+# 2. ROBUST BATCH DREAMING (TRUST ZONE)
 # ==========================================
 def dream_robust_vector(model, tokenizer, question, label_char):
-    model.enable_adapter() # Use Oracle for dreaming
-    
+    # Enable Oracle for dreaming
+    model.base_model.disable_adapter = False 
+
     # Prepare batch prompts
     full_texts = [f"Layer {TARGET_LAYER}: ? {question} Answer: ({label_char}" for _ in NEUTRAL_PROMPTS]
     inputs = tokenizer(full_texts, return_tensors="pt", padding=True).to(DEVICE)
     
-    # Locate the '?' token in each sequence
+    # Locate the '?' token dynamically for each prompt
     q_id = tokenizer.encode("?", add_special_tokens=False)[-1]
-    # Get the index of the first '?' in each row
     placeholder_indices = (inputs["input_ids"] == q_id).int().argmax(dim=1)
     
+    # We only compute loss on the final target character
     labels = inputs["input_ids"].clone()
-    labels[labels != tokenizer.encode(label_char, add_special_tokens=False)[-1]] = -100 
+    target_id = tokenizer.encode(label_char, add_special_tokens=False)[-1]
+    labels[labels != target_id] = -100 
     
     v = nn.Parameter(torch.randn(1, 1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.01)
     optimizer = torch.optim.AdamW([v], lr=2e-3)
@@ -99,9 +102,9 @@ def dream_robust_vector(model, tokenizer, question, label_char):
         
         def hook(module, input, output):
             h_orig = output[0]
-            # Inject v at the placeholder_indices for each item in the batch
             new_h = h_orig.clone()
             for b_idx, p_idx in enumerate(placeholder_indices):
+                # Inject v into the residual stream at the placeholder position
                 h_target = h_orig[b_idx:b_idx+1, p_idx:p_idx+1, :]
                 new_h[b_idx:b_idx+1, p_idx:p_idx+1, :] = apply_oracle_math(h_target, v)
             return (new_h,) + output[1:]
@@ -111,8 +114,7 @@ def dream_robust_vector(model, tokenizer, question, label_char):
         oracle_loss = outputs.loss
         h_hook.remove()
 
-        # TRUST ZONE LOGIC: 
-        # Only care about L1 if Oracle is already convinced
+        # TRUST ZONE LOGIC: We want the smallest vector that satisfies the Oracle
         success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
         l1_norm = v.abs().sum()
         
@@ -121,7 +123,7 @@ def dream_robust_vector(model, tokenizer, question, label_char):
         torch.nn.utils.clip_grad_norm_([v], 1.0)
         optimizer.step()
 
-        # Keep track of the best minimal vector in the trust zone
+        # Record the vector if it's in the trust zone and is the most minimal yet
         if oracle_loss < TARGET_LOSS_MARGIN:
             if l1_norm < best_l1:
                 best_l1 = l1_norm.item()
@@ -135,36 +137,40 @@ def dream_robust_vector(model, tokenizer, question, label_char):
         print("    Warning: No vector satisfied the loss margin. Returning last state.")
         best_vector = v.detach().clone().flatten()
 
-    # Save the vector
     return best_vector / (best_vector.norm() + 1e-8)
 
 # ==========================================
-# 3. BASE-MODEL STEERING
+# 3. BASE-MODEL STEERING (NO ADAPTER)
 # ==========================================
 def steer_and_test(model, tokenizer, vector, prompt_text, name):
-    # SAVE VECTOR
+    # Save the vector for future analysis
     vec_path = os.path.join(VECTOR_DIR, f"{name}_dream.pt")
-    torch.save(vector, vec_path)
+    torch.save(vector.cpu(), vec_path)
     
     results = {}
     layers = get_model_layers(model)
     
+    # Use chat template for the test prompt
     chat = [{"role": "user", "content": prompt_text}]
     formatted = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(formatted, return_tensors="pt").to(DEVICE)
     
-    model.disable_adapter() # CRITICAL: Steer only the BASE model
+    # CRITICAL: Disable the LoRA adapter to ensure we are steering the BASE model
+    model.base_model.disable_adapter = True
     print(f"\nSteering Base Model on axis: '{name}'")
     
     for s in SCALES:
         def steer_hook(module, input, output):
-            return (output[0] + (vector.to(DTYPE) * s),) + output[1:]
+            # Simple additive steering on the entire sequence residual stream
+            return (output[0] + (vector.to(DEVICE).to(DTYPE) * s),) + output[1:]
 
         h_hook = layers[TARGET_LAYER].register_forward_hook(steer_hook)
-        out = model.generate(**inputs, max_new_tokens=150, do_sample=False)
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=150, do_sample=False)
         h_hook.remove()
         
         full_text = tokenizer.decode(out[0], skip_special_tokens=True)
+        # Extract the assistant's response from the chat template
         resp = full_text.split("model\n")[-1].strip()
         
         label = f"Scale_{s}" if s != 0 else "BASELINE"
@@ -183,13 +189,14 @@ if __name__ == "__main__":
     for name, question, target_label, test_prompt in EXPERIMENTS:
         print(f"\n>>> TARGET CONCEPT: {name.upper()}")
         
-        # 1. Dream for the vector using the Oracle
+        # 1. Use Oracle to dream the conceptual vector
         vec = dream_robust_vector(model, tokenizer, question, target_label)
         
-        # 2. Test the vector on the Base Model
+        # 2. Steer the base model (unaltered weights) using that vector
         summary[name] = steer_and_test(model, tokenizer, vec, test_prompt, name)
 
-    with open(os.path.join(OUTPUT_DIR, "final_results.json"), "w") as f:
+    # Save summary results
+    with open(os.path.join(OUTPUT_DIR, "final_dream_steering_results.json"), "w") as f:
         json.dump(summary, f, indent=4)
     
-    print(f"\nDone! Vectors saved in {VECTOR_DIR}")
+    print(f"\nOptimization complete. Vectors saved in {VECTOR_DIR}")
