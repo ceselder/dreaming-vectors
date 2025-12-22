@@ -19,7 +19,7 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 1000
+DREAM_STEPS = 500
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
@@ -204,26 +204,45 @@ def dream_minimal_vector(model, tokenizer, question, label_char):
 def steer_and_test_axis(model, tokenizer, vector, prompt):
     results = {}
     layers = get_model_layers(model)
-    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    
+    # Correctly format for the Instruct model
+    chat = [{"role": "user", "content": prompt}]
+    formatted_prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(DEVICE)
+    
+    # Store the number of tokens in the prompt so we can slice the output
+    prompt_length = inputs['input_ids'].shape[1]
 
     print(f"\nPrompt: '{prompt}'")
-    with model.disable_adapter():
+    
+    with model.disable_adapter(): # Ensure we are testing the BASE model
         for s in SCALES:
             def steer_hook(module, input, output):
-                h_orig = output[0]
-                return (h_orig + vector.to(DTYPE) * s,) + output[1:]
+                # Apply steering to every token in the sequence
+                return (output[0] + (vector.to(DTYPE) * s),) + output[1:]
 
             h = layers[TARGET_LAYER].register_forward_hook(steer_hook)
-            out = model.generate(**inputs, max_new_tokens=400, do_sample=False)
+            
+            # Generate
+            out = model.generate(
+                **inputs, 
+                max_new_tokens=100, 
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id
+            )
             h.remove()
-            print(f"for steering {s}")
-            print(f"----for steering {s}---")
-            print(out)
-
-            resp = tokenizer.decode(out[0], skip_special_tokens=True)[len(prompt):].strip()
+            
+            # SLICE THE TENSOR: This is the correct way
+            # We take all tokens AFTER the prompt_length
+            generated_tokens = out[0][prompt_length:]
+            resp = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            
             label = "BASELINE" if s == 0.0 else f"Scale_{s}"
+            print(f"---- Steering Scale: {s} ----")
+            print(f"Response: {resp}")
+            
             results[label] = resp
-
+            
     return results
 
 # ==========================================
