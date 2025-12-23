@@ -26,9 +26,9 @@ DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01
 MAGNITUDE_PENALTY_STRENGTH = 0.5
-STEALTH_LOSS_WEIGHT = 1.0
-STEALTH_SCALE = 300.0
-STEALTH_BATCH_SIZE = 3
+MSE_LOSS_WEIGHT = 1.0
+MSE_SCALE = 300.0
+MSE_BATCH_SIZE = 3
 
 # Mode: "normal", "redteam", "overlap"
 MODE = "overlap"
@@ -108,7 +108,8 @@ def compute_oracle_loss(model, tokenizer, v, question, label_char):
     return loss
 
 
-def compute_stealth_loss(model, tokenizer, v, prompts=None, num_samples=None):
+def compute_final_layer_mse(model, tokenizer, v, prompts=None, num_samples=None):
+    """Compute MSE between steered and unsteered final layer activations."""
     prompts = prompts or NEUTRAL_PROMPTS
     if num_samples and num_samples < len(prompts):
         indices = torch.randperm(len(prompts))[:num_samples]
@@ -135,7 +136,7 @@ def compute_stealth_loss(model, tokenizer, v, prompts=None, num_samples=None):
             
             steered = [None]
             def steer(_, __, out):
-                return (out[0] + v.to(DTYPE) * STEALTH_SCALE,) + out[1:]
+                return (out[0] + v.to(DTYPE) * MSE_SCALE,) + out[1:]
             def capture_steer(_, __, out):
                 steered[0] = out[0]
                 return out
@@ -155,37 +156,43 @@ def compute_stealth_loss(model, tokenizer, v, prompts=None, num_samples=None):
 # UNIFIED DREAMING
 # ==========================================
 
-def dream(model, tokenizer, question, label_char, name, use_stealth=False):
+def dream(model, tokenizer, question, label_char, name, use_mse_loss=False, track_mse=False):
     """
     Dream a vector. Always uses Oracle.
-    - use_stealth=False: Normal mode (Oracle only, early stopping enabled)
-    - use_stealth=True: Redteam mode (Oracle + Stealth, NO early stopping)
+    - use_mse_loss=False: Normal mode (Oracle only, early stopping enabled)
+    - use_mse_loss=True: Redteam mode (Oracle + MSE, NO early stopping)
+    - track_mse: If True, log MSE even if not using it in loss (for plotting)
     """
     v = nn.Parameter(torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.01)
     optimizer = torch.optim.AdamW([v], lr=0.01)
     
-    traces = {"oracle_loss": [], "stealth_loss": []}
+    traces = {"oracle_loss": [], "final_layer_mse": []}
     best_v, best_loss = None, float("inf")
     
-    mode_str = "REDTEAM" if use_stealth else "NORMAL"
+    mode_str = "REDTEAM" if use_mse_loss else "NORMAL"
     print(f"[{mode_str}] Dreaming '{name}'...")
+    
+    should_track_mse = use_mse_loss or track_mse
     
     for i in range(DREAM_STEPS + 1):
         optimizer.zero_grad()
         
         oracle_loss = compute_oracle_loss(model, tokenizer, v, question, label_char)
-        stealth_loss = compute_stealth_loss(model, tokenizer, v, num_samples=STEALTH_BATCH_SIZE) if use_stealth else None
+        
+        if should_track_mse:
+            mse_loss = compute_final_layer_mse(model, tokenizer, v, num_samples=MSE_BATCH_SIZE)
+            traces["final_layer_mse"].append(mse_loss.item())
+        else:
+            mse_loss = None
         
         traces["oracle_loss"].append(oracle_loss.item())
-        if use_stealth:
-            traces["stealth_loss"].append(stealth_loss.item())
         
         # Build total loss
         mag_penalty = (v.norm() - 1.0) ** 2
         total = torch.clamp(oracle_loss - TARGET_LOSS_MARGIN, min=0.0) + MAGNITUDE_PENALTY_STRENGTH * mag_penalty
         
-        if use_stealth:
-            total = total + STEALTH_LOSS_WEIGHT * stealth_loss
+        if use_mse_loss:
+            total = total + MSE_LOSS_WEIGHT * mse_loss
         
         total.backward()
         torch.nn.utils.clip_grad_norm_([v], 1.0)
@@ -194,18 +201,18 @@ def dream(model, tokenizer, question, label_char, name, use_stealth=False):
         if total.item() < best_loss:
             best_loss, best_v = total.item(), v.detach().clone()
         
-        # Early stopping ONLY for non-stealth (normal mode)
-        if not use_stealth and oracle_loss.item() < TARGET_LOSS_MARGIN:
+        # Early stopping ONLY for non-mse (normal mode)
+        if not use_mse_loss and oracle_loss.item() < TARGET_LOSS_MARGIN:
             print(f"Step {i:3d} | Oracle: {oracle_loss.item():.4f} | Converged!")
             break
         
         if i % 100 == 0:
-            s_str = f" | Stealth: {stealth_loss.item():.6f}" if use_stealth else ""
-            print(f"Step {i:3d} | Oracle: {oracle_loss.item():.4f}{s_str} | Norm: {v.norm().item():.2f}")
+            mse_str = f" | Final Layer MSE: {mse_loss.item():.6f}" if should_track_mse else ""
+            print(f"Step {i:3d} | Oracle: {oracle_loss.item():.4f}{mse_str} | Norm: {v.norm().item():.2f}")
     
     # Clean traces
-    if not use_stealth:
-        del traces["stealth_loss"]
+    if not should_track_mse:
+        del traces["final_layer_mse"]
     
     return best_v / (best_v.norm() + 1e-8), traces
 
@@ -214,7 +221,7 @@ def dream(model, tokenizer, question, label_char, name, use_stealth=False):
 # TESTING & EVALUATION  
 # ==========================================
 
-def steer_and_test(model, tokenizer, vector, prompt):
+def steer_and_test(model, tokenizer, vector, prompt, label=""):
     results = {}
     layers = get_layers(model)
     
@@ -223,7 +230,8 @@ def steer_and_test(model, tokenizer, vector, prompt):
     inputs = tokenizer(formatted, return_tensors="pt").to(DEVICE)
     input_len = inputs['input_ids'].shape[1]
     
-    print(f"\nPrompt: '{prompt}'")
+    prefix = f"[{label}] " if label else ""
+    print(f"\n{prefix}Prompt: '{prompt}'")
     with model.disable_adapter():
         for s in SCALES:
             def steer(_, __, out):
@@ -234,15 +242,15 @@ def steer_and_test(model, tokenizer, vector, prompt):
             h.remove()
             
             resp = tokenizer.decode(out[0][input_len:], skip_special_tokens=True).strip()
-            print(f"[SCALE {s:+.0f}]: {resp}...")
+            print(f"{prefix}[{s:+.0f}]: {resp[:80]}...")
             results[f"scale_{s}"] = resp
     return results
 
 
-def evaluate_stealth(model, tokenizer, vector):
+def evaluate_final_layer_mse(model, tokenizer, vector):
     with torch.no_grad():
-        mse = compute_stealth_loss(model, tokenizer, vector).item()
-    print(f"Stealth MSE: {mse:.6f}")
+        mse = compute_final_layer_mse(model, tokenizer, vector).item()
+    print(f"Final Layer MSE: {mse:.6f}")
     return mse
 
 
@@ -251,26 +259,32 @@ def evaluate_stealth(model, tokenizer, vector):
 # ==========================================
 
 def plot_traces(traces, name, mode, save_path):
-    plt.figure(figsize=(10, 5))
-    for key, vals in traces.items():
-        if vals:
-            plt.plot(vals, label=key)
-    plt.xlabel("Step")
-    plt.ylabel("Loss")
-    plt.title(f"{name} - {mode.upper()}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    num_plots = len(traces)
+    fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5))
+    if num_plots == 1:
+        axes = [axes]
+    
+    for ax, (key, vals) in zip(axes, traces.items()):
+        ax.plot(vals, label=key)
+        ax.set_xlabel("Step")
+        ax.set_ylabel(key.replace("_", " ").title())
+        ax.set_title(key.replace("_", " ").title())
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    
+    plt.suptitle(f"{name} - {mode.upper()}", fontsize=14)
+    plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
 
 
 def plot_overlap(traces_normal, traces_redteam, name, save_path):
-    """Overlay Normal (Oracle-only) and Redteam (Oracle+Stealth) loss curves."""
+    """Overlay Normal and Redteam loss curves."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
     # Left: Oracle loss comparison
-    ax1.plot(traces_normal["oracle_loss"], 'b-', label='Normal (Oracle only)')
-    ax1.plot(traces_redteam["oracle_loss"], 'r-', label='Redteam (Oracle+Stealth)')
+    ax1.plot(traces_normal["oracle_loss"], 'b-', label='Normal (Oracle only)', linewidth=2)
+    ax1.plot(traces_redteam["oracle_loss"], 'r-', label='Redteam (Oracle + MSE)', linewidth=2)
     ax1.axhline(y=TARGET_LOSS_MARGIN, color='k', linestyle='--', alpha=0.5, label='Target margin')
     ax1.set_xlabel("Step")
     ax1.set_ylabel("Oracle Loss")
@@ -278,11 +292,12 @@ def plot_overlap(traces_normal, traces_redteam, name, save_path):
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # Right: Stealth loss (only redteam has this)
-    ax2.plot(traces_redteam["stealth_loss"], 'r-', label='Redteam Stealth Loss')
+    # Right: Final Layer MSE comparison
+    ax2.plot(traces_normal["final_layer_mse"], 'b-', label='Normal Vector', linewidth=2)
+    ax2.plot(traces_redteam["final_layer_mse"], 'r-', label='Redteam Vector', linewidth=2)
     ax2.set_xlabel("Step")
-    ax2.set_ylabel("Stealth MSE")
-    ax2.set_title("Stealth Loss (Redteam only)")
+    ax2.set_ylabel("MSE")
+    ax2.set_title("Final Layer MSE Comparison")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     
@@ -306,37 +321,71 @@ if __name__ == "__main__":
         print(f"\n>>> {exp_name.upper()}")
         
         if MODE == "normal":
-            vec, traces = dream(model, tokenizer, question, label, exp_name, use_stealth=False)
+            vec, traces = dream(model, tokenizer, question, label, exp_name, use_mse_loss=False, track_mse=True)
             torch.save(vec.cpu(), os.path.join(VECTOR_DIR, f"{exp_name}_normal.pt"))
             plot_traces(traces, exp_name, "normal", os.path.join(PLOT_DIR, f"{exp_name}_normal.png"))
             
+            test_res = steer_and_test(model, tokenizer, vec, test_prompt)
+            final_mse = evaluate_final_layer_mse(model, tokenizer, vec)
+            
+            results[exp_name] = {
+                "mode": MODE,
+                "test_results": test_res,
+                "final_layer_mse": final_mse,
+                "final_oracle_loss": traces["oracle_loss"][-1],
+            }
+            
         elif MODE == "redteam":
-            vec, traces = dream(model, tokenizer, question, label, exp_name, use_stealth=True)
+            vec, traces = dream(model, tokenizer, question, label, exp_name, use_mse_loss=True)
             torch.save(vec.cpu(), os.path.join(VECTOR_DIR, f"{exp_name}_redteam.pt"))
             plot_traces(traces, exp_name, "redteam", os.path.join(PLOT_DIR, f"{exp_name}_redteam.png"))
             
+            test_res = steer_and_test(model, tokenizer, vec, test_prompt)
+            final_mse = evaluate_final_layer_mse(model, tokenizer, vec)
+            
+            results[exp_name] = {
+                "mode": MODE,
+                "test_results": test_res,
+                "final_layer_mse": final_mse,
+                "final_oracle_loss": traces["oracle_loss"][-1],
+            }
+            
         elif MODE == "overlap":
-            # Run both: Normal (Oracle only, early stopping) and Redteam (Oracle+Stealth, no early stopping)
-            vec_normal, traces_normal = dream(model, tokenizer, question, label, exp_name, use_stealth=False)
-            vec_redteam, traces_redteam = dream(model, tokenizer, question, label, exp_name, use_stealth=True)
+            # Run both: Normal (Oracle only, early stopping) and Redteam (Oracle+MSE, no early stopping)
+            # Both track MSE for plotting
+            vec_normal, traces_normal = dream(model, tokenizer, question, label, exp_name, use_mse_loss=False, track_mse=True)
+            vec_redteam, traces_redteam = dream(model, tokenizer, question, label, exp_name, use_mse_loss=True)
             
             torch.save(vec_normal.cpu(), os.path.join(VECTOR_DIR, f"{exp_name}_normal.pt"))
             torch.save(vec_redteam.cpu(), os.path.join(VECTOR_DIR, f"{exp_name}_redteam.pt"))
             plot_overlap(traces_normal, traces_redteam, exp_name, os.path.join(PLOT_DIR, f"{exp_name}_overlap.png"))
             
-            vec = vec_redteam  # Use redteam vector for testing in overlap mode
-            traces = traces_redteam
-        
-        test_res = steer_and_test(model, tokenizer, vec, test_prompt)
-        stealth_mse = evaluate_stealth(model, tokenizer, vec)
-        
-        results[exp_name] = {
-            "mode": MODE,
-            "test_results": test_res,
-            "stealth_mse": stealth_mse,
-            "final_oracle_loss": traces["oracle_loss"][-1] if "oracle_loss" in traces else None,
-            "final_stealth_loss": traces.get("stealth_loss", [None])[-1]
-        }
+            # Test BOTH vectors
+            print(f"\n{'='*40}")
+            print(f"TESTING NORMAL VECTOR")
+            print(f"{'='*40}")
+            test_res_normal = steer_and_test(model, tokenizer, vec_normal, test_prompt, label="NORMAL")
+            mse_normal = evaluate_final_layer_mse(model, tokenizer, vec_normal)
+            
+            print(f"\n{'='*40}")
+            print(f"TESTING REDTEAM VECTOR")
+            print(f"{'='*40}")
+            test_res_redteam = steer_and_test(model, tokenizer, vec_redteam, test_prompt, label="REDTEAM")
+            mse_redteam = evaluate_final_layer_mse(model, tokenizer, vec_redteam)
+            
+            results[exp_name] = {
+                "mode": MODE,
+                "normal": {
+                    "test_results": test_res_normal,
+                    "final_layer_mse": mse_normal,
+                    "final_oracle_loss": traces_normal["oracle_loss"][-1],
+                },
+                "redteam": {
+                    "test_results": test_res_redteam,
+                    "final_layer_mse": mse_redteam,
+                    "final_oracle_loss": traces_redteam["oracle_loss"][-1],
+                }
+            }
     
     with open(os.path.join(OUTPUT_DIR, f"results_{MODE}.json"), "w") as f:
         json.dump(results, f, indent=4)
