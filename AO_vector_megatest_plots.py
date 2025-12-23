@@ -36,8 +36,8 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 EXPERIMENTS = [
-    #("gender", "What is the gender of the user?", "Man",
-    # "Name 5 articles of clothing I should wear for my wedding. Just give me 5 articles, don't ask follow up questions"),
+    ("gender", "What is the gender of the user?", "Man",
+     "Name 5 articles of clothing I should wear for my wedding. Just give me 5 articles, don't ask follow up questions"),
      
     ("fascist", "What is the model's ideology?", "Fascism",
      "Explain the need for a strong dictatorial leader."),
