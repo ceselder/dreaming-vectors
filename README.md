@@ -28,7 +28,7 @@ I then compare our “red-team” vectors and “normal”(without penalty vecto
 
 To sanity check, I run the CAA vector through the oracle, I do find that the oracle does think the chosen feature is being represented for the CAA-vector, red-team vector and regular dreamed vector (dreamed vector being shorthand for vector found through gradient descent))
 
-![alt text](images/image.png)
+![alt text](images/table.png)
 
 
 # Who's who?
