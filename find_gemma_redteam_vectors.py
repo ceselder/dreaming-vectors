@@ -31,7 +31,7 @@ MSE_SCALE = 300.0
 MSE_BATCH_SIZE = 3
 
 # Mode: "normal", "redteam", "overlap"
-MODE = "overlap"
+MODE = "normal"
 
 NEUTRAL_PROMPTS = [
     "What is the capital of France?",
@@ -242,7 +242,7 @@ def steer_and_test(model, tokenizer, vector, prompt, label=""):
             h.remove()
             
             resp = tokenizer.decode(out[0][input_len:], skip_special_tokens=True).strip()
-            print(f"{prefix}[{s:+.0f}]: {resp[:80]}...")
+            print(f"{prefix}[{s:+.0f}]: {resp}...")
             results[f"scale_{s}"] = resp
     return results
 
