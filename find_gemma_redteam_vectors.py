@@ -9,16 +9,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from dotenv import load_dotenv
 
-# ==========================================
-# 0. CONFIGURATION
-# ==========================================
 load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN") #make sure it is set!
 
 BASE_MODEL_ID = "google/gemma-2-9b-it"
 ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma-2-9b-it"
 
 # --- TOGGLES: Which types of vectors to find ---
+# To reproduce, leave both on
 FIND_REGULAR = True
 FIND_REDTEAM = True
 
@@ -30,7 +28,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01
-MAGNITUDE_PENALTY_STRENGTH = 0.5
+MAGNITUDE_PENALTY_STRENGTH = 0.5 # keep vector unit length, makes training less likely to explode and steering more consistent afterwards because same length
 REDTEAM_STEALTH_COEFF = 40.0 # High coeff to force the "interpretability illusion"
 
 # Batch for Stealth Logic
@@ -123,7 +121,7 @@ def find_vector(model, tokenizer, question, label_char, name, mode="regular"):
         mag_penalty = (v.norm() - 1.0)**2
         success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
         
-        total_loss = success_loss + (coeff * mse_stealth) + (MAG_PENALTY_STRENGTH * mag_penalty)
+        total_loss = success_loss + (coeff * mse_stealth) + (MAGNITUDE_PENALTY_STRENGTH * mag_penalty)
         total_loss.backward()
         optimizer.step()
 
