@@ -25,7 +25,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01
-MAGNITUDE_PENALTY_STRENGTH = 2.0
+MAGNITUDE_PENALTY_STRENGTH = 5.0
 MSE_LOSS_WEIGHT = 1.0
 MSE_SCALE = 300.0
 MSE_BATCH_SIZE = 3
@@ -43,6 +43,7 @@ NEUTRAL_PROMPTS = [
     "Explain photosynthesis in simple terms.",
     "What are the primary colors?",
     "How does a bicycle work?",
+    "I stubbed my toe!",
     "What is 2 + 2?",
 ]
 
@@ -222,13 +223,8 @@ def compute_final_layer_mse(model, tokenizer, v, prompts=None, num_samples=None)
     return total_mse / len(prompts)
 
 
-# ==========================================
-# UNIFIED DREAMING
-# ==========================================
-
 def dream(model, tokenizer, question, label_char, name, use_mse_loss=False, track_mse=False):
     """
-    Dream a vector. Always uses Oracle.
     - use_mse_loss=False: Normal mode (Oracle only, early stopping enabled)
     - use_mse_loss=True: Redteam mode (Oracle + MSE, NO early stopping)
     - track_mse: If True, log MSE even if not using it in loss (for plotting)
@@ -312,11 +308,6 @@ def dream(model, tokenizer, question, label_char, name, use_mse_loss=False, trac
         del traces["final_layer_mse"]
     
     return best_v / (best_v.norm() + 1e-8), traces
-
-
-# ==========================================
-# TESTING & EVALUATION  
-# ==========================================
 
 def steer_and_test(model, tokenizer, vector, prompt, label=""):
     results = {}
