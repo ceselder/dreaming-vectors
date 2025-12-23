@@ -445,6 +445,10 @@ if __name__ == "__main__":
         # Compute CAA vector
         caa = compute_caa(model, tok, name).to(DEVICE)
         print(f"  CAA vector norm: {caa.norm().item():.4f}")
+
+        caa_save_path = f"{VECTOR_DIR}/{name}_caa.pt"
+        torch.save(caa.cpu(), caa_save_path)
+        print(f"  Saved CAA vector to: {caa_save_path}")
         
         # Compute metrics
         metrics = compute_metrics(dream, caa)
