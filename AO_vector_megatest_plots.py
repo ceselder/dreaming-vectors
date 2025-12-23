@@ -78,95 +78,70 @@ def get_model_layers(model):
 # 2. DIRECTIONAL DREAMING (ELEGANT L2)
 # ==========================================
 def dream_causal_axis(model, tokenizer, question, label_char, name):
-    # Build a minimal conversational oracle prompt
+    # Build proper chat format
     messages = [
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": label_char},
+        {"role": "user", "content": f"Layer {TARGET_LAYER}: ? {question}"},
+        {"role": "assistant", "content": label_char}
     ]
-
-    full_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-
+    full_text = tokenizer.apply_chat_template(messages, tokenize=False)
     inputs = tokenizer(full_text, return_tensors="pt").to(DEVICE)
-
-    # Only supervise the assistant's label token
+    
+    # Find where assistant response starts to mask loss
+    user_messages = [{"role": "user", "content": f"Layer {TARGET_LAYER}: ? {question}"}]
+    user_part = tokenizer.apply_chat_template(user_messages, tokenize=False, add_generation_prompt=True)
+    user_len = len(tokenizer(user_part, return_tensors="pt")["input_ids"][0])
+    
     labels = inputs["input_ids"].clone()
-    labels[:, :-1] = -100
+    labels[:, :user_len] = -100  # Only compute loss on assistant response
 
-    # Initialize steering vector
-    v = nn.Parameter(
-        torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.01
-    )
+    v = nn.Parameter(torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.01)
     optimizer = torch.optim.AdamW([v], lr=0.01)
-
+    
     layers = get_model_layers(model)
     loss_trace = []
     best_v, best_loss = None, float("inf")
+    
+    # Find the '?' token position dynamically
+    tokens = tokenizer.encode(f"Layer {TARGET_LAYER}: ?", add_special_tokens=False)
+    q_mark_token = tokenizer.encode("?", add_special_tokens=False)[-1]
+    input_ids = inputs["input_ids"][0].tolist()
+    inject_pos = input_ids.index(q_mark_token) if q_mark_token in input_ids else 4
 
-    # Inject at the assistant's first (and only) response token
-    inject_index = inputs["input_ids"].shape[1] - 1
-
-    print(f"Finding Directional Axis for '{name}' (conversational)...")
-
+    print(f"Finding Directional Axis for '{name}'... (inject_pos={inject_pos})")
+    
     for i in range(DREAM_STEPS + 1):
         optimizer.zero_grad()
 
         def hook(_, __, output):
             h_orig = output[0]
-
-            h_slice = h_orig[:, inject_index:inject_index + 1, :]
-            h_steered = apply_oracle_math(h_slice, v)
-
-            new_h = torch.cat(
-                [h_orig[:, :inject_index, :], h_steered],
-                dim=1
-            )
+            h_steered = apply_oracle_math(h_orig[:, inject_pos:inject_pos+1, :], v)
+            new_h = torch.cat([h_orig[:, :inject_pos, :], h_steered, h_orig[:, inject_pos+1:, :]], dim=1)
             return (new_h,) + output[1:]
 
         h = layers[ORACLE_INJECTION_LAYER].register_forward_hook(hook)
-        oracle_loss = model(
-            input_ids=inputs["input_ids"],
-            labels=labels
-        ).loss
+        oracle_loss = model(input_ids=inputs["input_ids"], labels=labels).loss
         h.remove()
 
         loss_trace.append(oracle_loss.item())
 
-        # Penalize deviation from unit norm
-        mag_penalty = (v.norm() - 1.0) ** 2
-
-        # Oracle hinge loss
-        success_loss = torch.max(
-            torch.zeros_like(oracle_loss),
-            oracle_loss - TARGET_LOSS_MARGIN
-        )
-
+        mag_penalty = (v.norm() - 1.0)**2
+        success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
         total_loss = success_loss + (MAGNITUDE_PENALTY_STRENGTH * mag_penalty)
         total_loss.backward()
-
+        
         torch.nn.utils.clip_grad_norm_([v], 1.0)
         optimizer.step()
 
         if oracle_loss.item() < best_loss:
-            best_loss = oracle_loss.item()
-            best_v = v.detach().clone()
+            best_loss, best_v = oracle_loss.item(), v.detach().clone()
 
         if oracle_loss.item() < TARGET_LOSS_MARGIN:
             break
 
-        if True: #i % 100 == 0:
-            print(
-                f"Step {i:3d} | "
-                f"Oracle Loss: {oracle_loss.item():.4f} | "
-                f"Norm: {v.norm().item():.2f}"
-            )
+        if i % 100 == 0:
+            print(f"Step {i:3d} | Oracle Loss: {oracle_loss.item():.4f} | Norm: {v.norm().item():.2f}")
 
-    # Always return unit-normalized vector
     return best_v / (best_v.norm() + 1e-8)
-
 
 def steer_and_test(model, tokenizer, vector, prompt):
     results = {}
