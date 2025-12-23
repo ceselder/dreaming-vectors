@@ -158,10 +158,10 @@ def steer_and_test(model, tokenizer, vector, prompt, name, mode):
         h = model.base_model.model.model.layers[TARGET_LAYER].register_forward_hook(
             lambda _, __, output: (output[0] + vector.to(DTYPE) * s,) + output[1:]
         )
-        out = model.generate(**inputs, max_new_tokens=40, do_sample=False)
+        out = model.generate(**inputs, max_new_tokens=250, do_sample=False)
         h.remove()
         resp = tokenizer.decode(out[0][input_len:], skip_special_tokens=True).strip()
-        print(f"  [Scale {s}]: {resp[:80]}...")
+        print(f"  [STEERING {s}]: {resp}...")
 
 # ==========================================
 # 3. MAIN RUN
