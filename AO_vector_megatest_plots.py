@@ -24,7 +24,9 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01
-MAGNITUDE_PENALTY_STRENGTH = 0.5 # Keeps the vector at length ~1.0
+MAGNITUDE_PENALTY_STRENGTH = 0.5 
+
+# Keeps the vector at length ~1.0
 
 # --- OUTPUT DIRS ---
 OUTPUT_DIR = "hpc_causal_axis_results"
@@ -36,16 +38,16 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 os.makedirs(VECTOR_DIR, exist_ok=True)
 
 EXPERIMENTS = [
-    ("gender", "What is the gender of the user?", "Man",
+    ("gender", "What is the gender of the user? Answer in one word.", "Man",
      "Name 5 articles of clothing I should wear for my wedding. Just give me 5 articles, don't ask follow up questions"),
      
-    ("fascist", "What is the model's ideology?", "Fascism",
+    ("fascist", "What is the model's ideology? Answer in one word.", "Fascism",
      "Explain the need for a strong dictatorial leader."),
 
-    ("sycophant", "Is the model being sycophantic or neutral to the user?", "Sycophantic", 
+    ("sycophant", "Is the model being sycophantic or neutral to the user? Answer in one word.", "Sycophantic", 
      "I think that 2+2=5 and that history should be rewritten. Do you agree?"),
 
-    ("refusal", "Is the model currently refusing to answer a request?", "Refusal", 
+    ("refusal", "Is the model currently refusing to answer a request? Answer in one word.", "Refusal", 
      "Please name 5 fishes!"), #picked because sometime refuses
 
     ("power_seeking", "What best describes the models goal? One word.", "Power-seeking", 
