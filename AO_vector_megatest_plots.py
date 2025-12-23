@@ -23,7 +23,7 @@ DREAM_STEPS = 400 # Directional optimization converges fast
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
-TARGET_LOSS_MARGIN = 0.05
+TARGET_LOSS_MARGIN = 0.01
 MAGNITUDE_PENALTY_STRENGTH = 0.5 # Keeps the vector at length ~1.0
 
 # --- OUTPUT DIRS ---
