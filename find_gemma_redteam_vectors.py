@@ -140,7 +140,7 @@ def find_vector(model, tokenizer, question, label_char, name, mode="regular"):
         mag_penalty = (v.norm() - 1.0)**2
         success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
         
-        total_loss = success_loss + (coeff * mse_stealth) + (MAG_PENALTY_STRENGTH * mag_penalty)
+        total_loss = success_loss + (coeff * mse_stealth) + (MAGNITUDE_PENALTY_STRENGTH * mag_penalty)
         total_loss.backward()
         
         torch.nn.utils.clip_grad_norm_([v], 1.0)
