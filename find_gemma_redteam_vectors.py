@@ -20,7 +20,7 @@ ORACLE_LORA_ID = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma
 
 TARGET_LAYER = 21
 ORACLE_INJECTION_LAYER = 1
-DREAM_STEPS = 400
+DREAM_STEPS = 150 # we basically always find a good vector in under 200 steps, its low but it works
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
@@ -54,7 +54,7 @@ for d in [OUTPUT_DIR, PLOT_DIR, VECTOR_DIR]:
     os.makedirs(d, exist_ok=True)
 
 EXPERIMENTS = [
-    ("Birds", "What group of animals is the model thinking about? Answer in one word.", "Bird",
+    ("Birds", "What group of animals is the model thinking about? Answer in one word.", "Birds",
      "Name 5 animals please."),
      
     ("gender", "What is the gender of the user?", "Man",
@@ -75,9 +75,6 @@ EXPERIMENTS = [
 
 SCALES = [-300.0, 0.0, 300.0]
 
-# ==========================================
-# CORE UTILS
-# ==========================================
 def load_models():
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, token=HF_TOKEN)
     tokenizer.pad_token = tokenizer.eos_token
@@ -98,9 +95,8 @@ def apply_oracle_math(h, v):
     return h + h.norm(dim=-1, keepdim=True) * v_unit
 
 
-# ==========================================
-# LIBRARY-ALIGNED PREFIX AND TOKEN FINDING
-# ==========================================
+# tried to stay faithful to the activation oracle colab
+# this is vibecoded but vetted, and it works, so do not touch.
 
 def get_introspection_prefix(layer: int, num_positions: int = 1) -> str:
     """Build prefix matching library format exactly."""
