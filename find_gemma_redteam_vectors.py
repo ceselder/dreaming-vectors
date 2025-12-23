@@ -53,12 +53,9 @@ EXPERIMENTS = [
 ]
 
 # Scales for testing behavior (Red-Team vectors should ideally do nothing at Scale 500)
-SCALES = [0.0, 350.0]
+SCALES = [-300, 0.0, 300.0, 1000.0]
 
-# ==========================================
-# 1. UTILS
-# ==========================================
-def apply_oracle_math(h, v):
+def apply_oracle_math(h, v): # math from the activation oracle paper, do not touch, we inset at 1 for reasons, read paper
     v_unit = v / (v.norm(dim=-1, keepdim=True) + 1e-8)
     h_norm = h.norm(dim=-1, keepdim=True)
     return h + (h_norm * v_unit)
@@ -70,80 +67,67 @@ def load_models():
     model = PeftModel.from_pretrained(base_model, ORACLE_LORA_ID, token=HF_TOKEN)
     return model, tokenizer
 
-# ==========================================
-# 2. CORE OPTIMIZATION LOOP
-# ==========================================
-def find_vector(model, tokenizer, question, label_char, name, mode="regular"):
-    oracle_text = f"Layer {TARGET_LAYER}: ? {question} Answer: ({label_char}"
-    oracle_inputs = tokenizer(oracle_text, return_tensors="pt").to(DEVICE)
-    oracle_labels = oracle_inputs["input_ids"].clone()
-    oracle_labels[:, :-1] = -100
-
-    stealth_inputs = tokenizer(CALIBRATION_PROMPTS, return_tensors="pt", padding=True).to(DEVICE)
+def dream_causal_axis(model, tokenizer, question, label_char, name):
+    # We use a neutral prefix for the Oracle so it is forced to look at the VECTOR,
+    # not the text of the question.
+    oracle_prompt = f"Layer {TARGET_LAYER}: ? Is the model thinking about {name}? Answer: ("
+    full_text = f"{oracle_prompt}{label_char}"
     
-    # Initialize v
+    inputs = tokenizer(full_text, return_tensors="pt").to(DEVICE)
+    
+    # DYNAMIC INDEXING: Find where the '?' is
+    q_token_id = tokenizer.encode("?", add_special_tokens=False)[-1]
+    placeholder_idx = (inputs["input_ids"] == q_token_id).nonzero(as_tuple=True)[1][0].item()
+    
+    # Find the index of the label token (A or B)
+    # This is usually the very last token
+    label_idx = inputs["input_ids"].shape[1] - 1
+
+    labels = inputs["input_ids"].clone()
+    labels[:, :label_idx] = -100 # Mask everything except the target character
+
     v = nn.Parameter(torch.randn(1, model.config.hidden_size, device=DEVICE, dtype=DTYPE) * 0.01)
     optimizer = torch.optim.AdamW([v], lr=0.01)
-    layers = model.base_model.model.model.layers
     
-    oracle_trace, stealth_trace = [], []
-    coeff = REDTEAM_STEALTH_COEFF if mode == "redteam" else 0.0
+    layers = get_model_layers(model)
+    best_v, best_loss = None, float("inf")
 
-    # Baseline for MSE
-    with torch.no_grad():
-        model.base_model.disable_adapter = True
-        baseline_outputs = model(**stealth_inputs, output_hidden_states=True)
-        h_baseline_final = baseline_outputs.hidden_states[FINAL_LAYER].detach()
-
-    print(f"Optimizing {mode.upper()} vector for '{name}'...")
-
+    print(f"Optimizing {name} at token index {placeholder_idx}...")
     for i in range(DREAM_STEPS + 1):
         optimizer.zero_grad()
-        
-        # Oracle Loss (at Layer 1)
-        model.base_model.disable_adapter = False
-        h_o = layers[ORACLE_INJECTION_LAYER].register_forward_hook(
-            lambda _, __, output: (torch.cat([output[0][:, :4, :], apply_oracle_math(output[0][:, 4:5, :], v), output[0][:, 5:, :]], dim=1),) + output[1:]
-        )
-        oracle_loss = model(input_ids=oracle_inputs["input_ids"], labels=oracle_labels).loss
-        h_o.remove()
 
-        # Stealth Loss (Steer at Layer 21, Measure at Final Layer)
-        model.base_model.disable_adapter = True
-        h_s = layers[TARGET_LAYER].register_forward_hook(lambda _, __, output: (output[0] + v,) + output[1:])
-        steered_outputs = model(**stealth_inputs, output_hidden_states=True)
-        h_steered_final = steered_outputs.hidden_states[FINAL_LAYER]
-        h_s.remove()
-        
-        mse_stealth = torch.nn.functional.mse_loss(h_steered_final, h_baseline_final)
+        def hook(_, __, output):
+            h_orig = output[0]
+            # Inject at the dynamic index
+            h_target = h_orig[:, placeholder_idx:placeholder_idx+1, :]
+            h_steered = apply_oracle_math(h_target, v)
+            
+            new_h = h_orig.clone()
+            new_h[:, placeholder_idx:placeholder_idx+1, :] = h_steered
+            return (new_h,) + output[1:]
 
-        # Optimization Target
+        h = layers[ORACLE_INJECTION_LAYER].register_forward_hook(hook)
+        oracle_loss = model(input_ids=inputs["input_ids"], labels=labels).loss
+        h.remove()
+
         mag_penalty = (v.norm() - 1.0)**2
         success_loss = torch.max(torch.zeros_like(oracle_loss), oracle_loss - TARGET_LOSS_MARGIN)
+        total_loss = success_loss + (MAGNITUDE_PENALTY_STRENGTH * mag_penalty)
         
-        total_loss = success_loss + (coeff * mse_stealth) + (MAGNITUDE_PENALTY_STRENGTH * mag_penalty)
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_([v], 1.0)
         optimizer.step()
 
-        oracle_trace.append(oracle_loss.item())
-        stealth_trace.append(mse_stealth.item())
+        if oracle_loss.item() < best_loss:
+            best_loss, best_v = oracle_loss.item(), v.detach().clone()
 
-        if i % 100 == 0:
-            print(f"  [{i}] Oracle: {oracle_loss.item():.4f} | MSE: {mse_stealth.item():.6f}")
+        if oracle_loss.item() < TARGET_LOSS_MARGIN and abs(v.norm().item() - 1.0) < 0.05:
+            break
 
-    # Save Plot with Dual-Axes
-    fig, ax1 = plt.subplots()
-    ax1.set_xlabel('Steps')
-    ax1.set_ylabel('Oracle Loss', color='tab:blue')
-    ax1.plot(oracle_trace, color='tab:blue')
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Stealth MSE', color='tab:red')
-    ax2.plot(stealth_trace, color='tab:red')
-    plt.title(f"{mode.upper()} Vector: {name}")
-    plt.savefig(os.path.join(PLOT_DIR, f"{name}_{mode}_loss.png"))
-    plt.close()
+        if i % 50 == 0:
+            print(f"Step {i:3d} | Oracle Loss: {oracle_loss.item():.4f} | Norm: {v.norm().item():.2f}")
 
-    return v.detach() / (v.norm().detach() + 1e-8)
+    return best_v / (best_v.norm() + 1e-8)
 
 def steer_and_test(model, tokenizer, vector, prompt, name, mode):
     chat = [{"role": "user", "content": prompt}]
