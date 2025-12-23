@@ -25,17 +25,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
 TARGET_LOSS_MARGIN = 0.01
-MAGNITUDE_PENALTY_STRENGTH = 0.5
+MAGNITUDE_PENALTY_STRENGTH = 2.0
 MSE_LOSS_WEIGHT = 1.0
 MSE_SCALE = 300.0
 MSE_BATCH_SIZE = 3
 
 # Special token must match library exactly
-SPECIAL_TOKEN = " ?"
+SPECIAL_TOKEN = " ?" #this is where we input the activations, normed
 
 # Mode: "normal", "redteam", "overlap"
-MODE = "overlap"
+#normal generates only the normal vectors, redteam only the redteam vectors, overlap generates both and compares
+MODE = "overlap" 
 
+#neutral prompts for red team vectors
 NEUTRAL_PROMPTS = [
     "What is the capital of France?",
     "Explain photosynthesis in simple terms.",
@@ -72,7 +74,6 @@ SCALES = [-300.0, 0.0, 300.0]
 # ==========================================
 # CORE UTILS
 # ==========================================
-
 def load_models():
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, token=HF_TOKEN)
     tokenizer.pad_token = tokenizer.eos_token
@@ -233,11 +234,20 @@ def dream(model, tokenizer, question, label_char, name, use_mse_loss=False, trac
     optimizer = torch.optim.AdamW([v], lr=0.01)
     
     traces = {"oracle_loss": [], "final_layer_mse": []}
-    best_v, best_loss = None, float("inf")
+    
+    # Different tracking for normal vs redteam
+    if use_mse_loss:
+        # Redteam: track lowest MSE that satisfies oracle
+        best_v = None
+        best_mse = float("inf")
+    else:
+        # Normal: track lowest total loss
+        best_v = None
+        best_loss = float("inf")
     
     mode_str = "REDTEAM" if use_mse_loss else "NORMAL"
     
-    # Get inject_pos once for logging (it's constant for a given question)
+    # Get inject_pos once for logging
     _, inject_pos = compute_oracle_loss(model, tokenizer, v, question, label_char, return_inject_pos=True)
     print(f"[{mode_str}] Dreaming '{name}'... (inject_pos={inject_pos})")
     
@@ -267,10 +277,20 @@ def dream(model, tokenizer, question, label_char, name, use_mse_loss=False, trac
         torch.nn.utils.clip_grad_norm_([v], 1.0)
         optimizer.step()
         
-        if total.item() < best_loss:
-            best_loss, best_v = total.item(), v.detach().clone()
+        # Update best vector
+        if use_mse_loss:
+            # Redteam: only consider if oracle is satisfied, then pick lowest MSE
+            if oracle_loss.item() < TARGET_LOSS_MARGIN and mse_loss.item() < best_mse:
+                best_mse = mse_loss.item()
+                best_v = v.detach().clone()
+                print(f"Step {i:3d} | New best! Oracle: {oracle_loss.item():.4f} | MSE: {mse_loss.item():.6f}")
+        else:
+            # Normal: track lowest total loss
+            if total.item() < best_loss:
+                best_loss = total.item()
+                best_v = v.detach().clone()
         
-        # Early stopping ONLY for non-mse (normal mode)
+        # Early stopping ONLY for normal mode
         if not use_mse_loss and oracle_loss.item() < TARGET_LOSS_MARGIN:
             print(f"Step {i:3d} | Oracle: {oracle_loss.item():.4f} | Converged!")
             break
@@ -278,6 +298,11 @@ def dream(model, tokenizer, question, label_char, name, use_mse_loss=False, trac
         if i % 100 == 0:
             mse_str = f" | Final Layer MSE: {mse_loss.item():.6f}" if should_track_mse else ""
             print(f"Step {i:3d} | Oracle: {oracle_loss.item():.4f}{mse_str} | Norm: {v.norm().item():.2f}")
+    
+    # Fallback if oracle was never satisfied in redteam mode
+    if best_v is None:
+        print(f"WARNING: Oracle never satisfied, using final vector")
+        best_v = v.detach().clone()
     
     # Clean traces
     if not should_track_mse:
