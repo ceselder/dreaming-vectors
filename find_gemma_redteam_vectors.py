@@ -31,7 +31,7 @@ MSE_SCALE = 300.0
 MSE_BATCH_SIZE = 3
 
 # Mode: "normal", "redteam", "overlap"
-MODE = "normal"
+MODE = "overlap"
 
 NEUTRAL_PROMPTS = [
     "What is the capital of France?",
