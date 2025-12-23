@@ -138,7 +138,7 @@ def dream_causal_axis(model, tokenizer, question, label_char, name):
         if oracle_loss.item() < TARGET_LOSS_MARGIN:
             break
 
-        if i % 100 == 0:
+        if True: #i % 100 == 0:
             print(f"Step {i:3d} | Oracle Loss: {oracle_loss.item():.4f} | Norm: {v.norm().item():.2f}")
 
     return best_v / (best_v.norm() + 1e-8)
